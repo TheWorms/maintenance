@@ -1,0 +1,10 @@
+# Fichiers produits par makepkg
+/maintenance-git/
+/src/
+/pkg/
+*.pkg.tar.*
+*.log
+
+# Python
+__pycache__/
+*.pyc

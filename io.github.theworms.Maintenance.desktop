@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Maintenance
+GenericName=Entretien du système
+Comment=Nettoyer, mettre à jour et surveiller le système
+Exec=maintenance
+Icon=applications-system
+Terminal=false
+Categories=System;Settings;
+Keywords=nettoyage;mise à jour;pacman;yay;doublons;disque;timeshift;
+StartupNotify=true
+StartupWMClass=io.github.theworms.Maintenance
