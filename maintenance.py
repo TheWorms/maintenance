@@ -141,7 +141,7 @@ gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, Gio, GLib, Pango  # noqa: E402
 
 APP_ID = 'io.github.theworms.Maintenance'
-VERSION = '1.4.1'
+VERSION = '1.5.1'
 REPO_URL = 'https://github.com/TheWorms/maintenance'
 REPO_API = 'https://api.github.com/repos/TheWorms/maintenance'
 PKG_NAME = 'maintenance-git'
@@ -520,6 +520,8 @@ def askpass_main(args):
 
 def password_dialog(prompt, ctx, tries, parent=None):
     dlg = Gtk.Dialog(title='Authentification requise', transient_for=parent, modal=parent is not None)
+    if parent is not None:
+        dlg.get_style_context().add_class('maint')
     dlg.set_icon_name('dialog-password')
     dlg.set_default_size(440, -1)
     dlg.add_button('Annuler', Gtk.ResponseType.CANCEL)
@@ -602,6 +604,8 @@ class Runner:
         self.busy = False
         self.cancel_req = False
         self.stopped = False     # la dernière opération a été arrêtée par le bouton
+        self.cur_label = ''      # étape en cours et dernière ligne affichée, pour la ligne « En cours »
+        self.last_line = ''
         self.cur = None          # ('user', Popen) ou ('root', numéro) : commande en cours
         self.cur_step = None
 
@@ -645,7 +649,6 @@ class Runner:
     def start(self, title, steps, done=None):
         if self.busy:
             return False
-        sim = self.win.sim
         self.t0 = time.monotonic()
         self.title = title
         self.cancel_req = False
@@ -655,26 +658,23 @@ class Runner:
         self.win.journal.add('')
         self.win.journal.add(f'==> {title}', 'h')
         self.win.show_journal(True)
-        threading.Thread(target=self._work, args=(title, list(steps), sim, done), daemon=True).start()
+        threading.Thread(target=self._work, args=(title, list(steps), done), daemon=True).start()
         return True
 
     def _log(self, text, tag=None):
         self.win.journal.log(text, tag)
 
-    def _work(self, title, steps, sim, done):
+    def _work(self, title, steps, done):
         ok_all = True
-        needs_root = any(s.root and (not s.modifies or not sim) for s in steps)
+        needs_root = any(s.root for s in steps)
         if needs_root and os.geteuid() != 0 and not self.win.session.ensure():
             self._log('Authentification annulée ou refusée : rien n’a été lancé.', 'e')
-            GLib.idle_add(self._finish, done, False, sim)
+            GLib.idle_add(self._finish, done, False)
             return
         for st in steps:
             if self.cancel_req:
                 break
             self.cur_step = st
-            if st.modifies and sim:
-                self._log(f'[simulation] {st.prompt()} {st.display()}', 's')
-                continue
             if st.pacman and os.path.exists(PACMAN_LOCK):
                 self._log('pacman est déjà utilisé par un autre programme (db.lck présent) : étape ignorée.', 'e')
                 ok_all = False
@@ -701,6 +701,7 @@ class Runner:
                     GLib.idle_add(st.capture, res, 0)
                 continue
             self._log(f'{st.prompt()} {st.display()}', 'c')
+            self.cur_label, self.last_line = st.display(), ''
             GLib.idle_add(self.win.set_step, st.display())
             if st.yay:
                 reset_askpass_counter()
@@ -724,7 +725,7 @@ class Runner:
                 if st.stop:
                     self._log('Arrêt : les étapes suivantes ne sont pas lancées.', 'e')
                     break
-        GLib.idle_add(self._finish, done, ok_all, sim)
+        GLib.idle_add(self._finish, done, ok_all)
 
     def _exec(self, argv, title, root=False, askpass=False, quiet=False, c_locale=False, env=None):
         if isinstance(argv, str):
@@ -783,18 +784,18 @@ class Runner:
             line = parts[-1] if parts else ''
         line = ANSI.sub('', line)
         lines.append(line)
+        if line.strip():
+            self.last_line = line.strip()
         if not quiet and line.strip():
             self._log('  ' + line)
 
-    def _finish(self, done, ok, sim):
+    def _finish(self, done, ok):
         took = time.monotonic() - self.t0
         j = self.win.journal
         stopped = self.stopped = self.cancel_req
         if stopped:
             ok = False
             j.add(f'■ Arrêté au bout de {duration(took)} : les étapes suivantes n’ont pas été lancées.', 's')
-        elif sim:
-            j.add('— Simulation terminée : rien n’a été modifié.', 's')
         elif ok:
             j.add(f'✓ Terminé en {duration(took)}.', 'h')
         else:
@@ -802,7 +803,7 @@ class Runner:
         app = self.win.get_application()
         if app and took > 5 and not self.win.is_active():
             n = Gio.Notification.new('Maintenance')
-            n.set_body(f'{self.title} : ' + ('arrêté' if stopped else 'simulation terminée' if sim else 'terminé' if ok
+            n.set_body(f'{self.title} : ' + ('arrêté' if stopped else 'terminé' if ok
                                               else 'terminé avec des erreurs'))
             app.send_notification('operation', n)
         self.busy = False
@@ -810,7 +811,7 @@ class Runner:
         self.cur = self.cur_step = None
         self.win.set_busy(False)
         if done:
-            done(ok, sim)
+            done(ok)
         return False
 
 
@@ -855,6 +856,32 @@ def chip(kind, text):
     return label(text, css=('chip', kind))
 
 
+TONES = ('ok', 'warn', 'crit', 'info', 'off', 'done')
+
+
+def set_tone(w, tone):
+    ctx = w.get_style_context()
+    for k in TONES:
+        ctx.remove_class(k)
+    ctx.add_class(tone if tone in TONES else 'off')
+
+
+def tone_tile(names, tone='off', size=42, icon_size=20, big=False):
+    """Icône symbolique sur un carré arrondi teinté de la couleur de l'état."""
+    box = Gtk.Box()
+    box.set_size_request(size, size)
+    box.set_valign(Gtk.Align.START)
+    box.set_halign(Gtk.Align.START)
+    box.get_style_context().add_class('tile')
+    if big:
+        box.get_style_context().add_class('big')
+    img = symbolic(names, icon_size)
+    box.pack_start(img, True, True, 0)
+    box.img = img
+    set_tone(box, tone)
+    return box
+
+
 def clear(box):
     for c in box.get_children():
         box.remove(c)
@@ -873,7 +900,7 @@ def button(text, style=None, lock=False, icon_name=None):
     b = Gtk.Button.new_with_label(text)
     if style:
         b.get_style_context().add_class(style)
-    name = 'changes-allow-symbolic' if lock else icon_name
+    name = 'changes-prevent-symbolic' if lock else icon_name
     if name:
         b.set_image(Gtk.Image.new_from_gicon(themed([name, 'dialog-password-symbolic']), Gtk.IconSize.BUTTON))
         b.set_always_show_image(True)
@@ -911,6 +938,7 @@ def scrolled_page():
 def confirm(win, title, text, ok_label='Continuer', destructive=False, items=None, kind=Gtk.MessageType.QUESTION):
     d = Gtk.MessageDialog(transient_for=win, modal=True, message_type=kind,
                           buttons=Gtk.ButtonsType.NONE, text=title)
+    d.get_style_context().add_class('maint')
     d.format_secondary_text(text)
     if items:
         lab = label('\n'.join(items), css=('mono',), selectable=True)
@@ -933,6 +961,7 @@ def confirm(win, title, text, ok_label='Continuer', destructive=False, items=Non
 def inform(win, title, text, kind=Gtk.MessageType.INFO):
     d = Gtk.MessageDialog(transient_for=win, modal=True, message_type=kind,
                           buttons=Gtk.ButtonsType.OK, text=title)
+    d.get_style_context().add_class('maint')
     d.format_secondary_text(text)
     d.run()
     d.destroy()
@@ -968,7 +997,7 @@ def launch_cmd(argv, log=None):
 #  Éléments de maintenance
 # ============================================================================
 DEFAULT_STATE = {'chip': None, 'value': '', 'details': [], 'amount': None, 'todo': False,
-                 'available': True, 'hint': '', 'count': 0}
+                 'available': True, 'hint': '', 'count': 0, 'table': None}
 
 
 class Action:
@@ -1017,6 +1046,7 @@ class Item:
     title = ''
     desc = ''
     icons = ['applications-system']
+    sym = ['applications-system-symbolic']
     requires = None
     install_pkg = None
     selectable = False
@@ -1031,6 +1061,7 @@ class Item:
         self.probing = False
         self.done_msg = None
         self.open = False
+        self.cmd_open = False
         self.extra = {}   # résultats d'analyse gardés entre deux rafraîchissements
         sel = win.settings.get('selection', {})
         self.selected = sel.get(self.id, self.default_sel)
@@ -1126,14 +1157,12 @@ class Item:
             self.row.update()
         modifies = any(s.modifies for s in steps)
 
-        def done(ok, sim):
+        def done(ok):
             self.busy = False
             if win.runner.stopped:
                 self.done_msg = ('off', 'Arrêté')
             elif not ok:
                 self.done_msg = ('crit', 'Échec')
-            elif sim and modifies:
-                self.done_msg = ('warn', 'Simulé')
             elif not modifies:
                 self.done_msg = ('done', 'Terminé')
             else:
@@ -1147,7 +1176,7 @@ class Item:
                 win.pages['apps'].load()
             win.after_action()
             if action.after:
-                action.after(ok, sim)
+                action.after(ok)
 
         if not win.runner.start(f'{self.title} · {action.label}', steps, done):
             self.busy = False
@@ -1665,8 +1694,8 @@ class SelfUpdate(Item):
             f.write('\n'.join(missing) + ('\n' if missing else ''))
         log('  ' + (f'à installer : {" ".join(missing)}' if missing else 'toutes les dépendances sont déjà là'))
 
-    def _after(self, ok, sim):
-        if ok and not sim:
+    def _after(self, ok):
+        if ok:
             self.win.offer_restart()
 
     def actions(self):
@@ -1717,13 +1746,14 @@ class Smart(Item):
         return {'chip': ('info', 'Analyse à lancer'), 'value': plural(len(disks), 'disque'), 'details': det}
 
     def _parse(self, out, rc):
-        det, bad = [], 0
+        det, bad, rows = [], 0, []
         for chunk in out.split('@@@ ')[1:]:
             dev, _, js = chunk.partition('\n')
             try:
                 data = json.loads(js)
             except ValueError:
                 det.append(f'{os.path.basename(dev)} · lecture impossible')
+                rows.append([(os.path.basename(dev), 'strong'), '—', ('lecture impossible', 'crit'), '—', '—', '—'])
                 continue
             passed = (data.get('smart_status') or {}).get('passed')
             temp = (data.get('temperature') or {}).get('current')
@@ -1741,14 +1771,24 @@ class Smart(Item):
             if passed is False:
                 bad += 1
             det.append(' · '.join([os.path.basename(dev), model, state] + extra))
+            realloc = next((str((a.get('raw') or {}).get('value', 0)) for a in
+                            (data.get('ata_smart_attributes') or {}).get('table', []) if a.get('id') == 5), '—')
+            rows.append([(os.path.basename(dev), 'strong'), model or '—',
+                         (state, 'ok' if passed else ('crit' if passed is False else '')),
+                         f'{temp} °C' if temp is not None else '—', f'{wear} %' if wear is not None else '—', realloc])
         if bad:
             chipv = ('crit', plural(bad, 'disque en difficulté', 'disques en difficulté'))
         elif det:
             chipv = ('ok', 'Disques en bon état')
         else:
             chipv = ('warn', 'Aucun résultat')
-        self.open = True
-        self.keep(chip=chipv, details=det, value='Analysé ' + time.strftime('le %d/%m à %H:%M'))
+        table = {'cols': ['Disque', 'Modèle', 'État', 'Température', 'Usure', 'Secteurs réalloués'], 'rows': rows}
+        if rows and all(r[4] == '—' for r in rows):
+            table = {'cols': table['cols'][:4] + table['cols'][5:], 'rows': [r[:4] + r[5:] for r in rows]}
+        if rows and all(r[-1] == '—' for r in table['rows']):
+            table = {'cols': table['cols'][:-1], 'rows': [r[:-1] for r in table['rows']]}
+        self.keep(chip=chipv, details=[], table=table if rows else None,
+                  value='Analysé ' + time.strftime('le %d/%m à %H:%M'))
         for line in det:
             self.win.journal.add('  ' + line)
         return False
@@ -1855,8 +1895,16 @@ class JournalErrors(Item):
         return {'chip': ('warn', plural(len(lines), 'erreur')), 'details': det, 'count': len(lines)}
 
     def actions(self):
-        return [Action('Afficher tout', [Step(['journalctl', '-b', '-p', 'err', '-q', '--no-pager', '-n', '300'],
+        acts = [Action('Afficher tout', [Step(['journalctl', '-b', '-p', 'err', '-q', '--no-pager', '-n', '300'],
                                               modifies=False)])]
+        acts.append(Action('Vider le journal système',
+                           [Step('journalctl --rotate && journalctl --vacuum-time=1s', root=True,
+                                 label='journalctl --rotate && journalctl --vacuum-time=1s')],
+                           confirm=('Vider le journal système ?',
+                                    'Tous les messages enregistrés par systemd seront supprimés, y compris ceux des '
+                                    'démarrages précédents. Les nouvelles erreurs réapparaîtront ici.'),
+                           destructive=True, refresh=('jrn',)))
+        return acts
 
 
 class DiskSpace(Item):
@@ -1889,8 +1937,8 @@ class DiskSpace(Item):
     def _show(self, res, rc):
         if res:
             det = [f'{name} · {fmt_size(size)}' for size, name in res]
-            self.open = True
-            self.keep(details=det, chip=('info', f'Le plus gros : {res[0][1]}'))
+            self.keep(details=[], table={'cols': ['Dossier', 'Taille'], 'rows': [[(n, 'strong'), fmt_size(z)] for z, n in res]},
+                      chip=('info', f'Le plus gros : {res[0][1]}'))
             for line in det:
                 self.win.journal.add('  ' + line)
         return False
@@ -2159,12 +2207,35 @@ class Kernels(Item):
                 'details': det, 'reboot': reboot, 'value': f'En cours : {release}'}
 
 
+SYM = {
+    'dl': ['folder-download-symbolic', 'document-save-symbolic'], 'pkg': ['package-x-generic-symbolic'],
+    'orph': ['package-x-generic-symbolic'], 'jrn': ['text-x-generic-symbolic'], 'aur': ['package-x-generic-symbolic'],
+    'uc': ['folder-symbolic'], 'th': ['image-x-generic-symbolic'], 'tr': ['user-trash-symbolic'],
+    'fpu': ['application-x-addon-symbolic', 'package-x-generic-symbolic'],
+    'dk': ['network-server-symbolic', 'package-x-generic-symbolic'],
+    'sys': ['software-update-available-symbolic', 'system-software-update-symbolic'],
+    'fpk': ['view-app-grid-symbolic', 'application-x-addon-symbolic'],
+    'fw': ['computer-chip-symbolic', 'computer-symbolic'],
+    'mir': ['network-workgroup-symbolic', 'network-server-symbolic'],
+    'key': ['dialog-password-symbolic', 'channel-secure-symbolic'],
+    'self': ['software-update-available-symbolic', 'view-refresh-symbolic'],
+    'smart': ['drive-harddisk-symbolic'], 'trim': ['drive-harddisk-solidstate-symbolic', 'drive-harddisk-symbolic'],
+    'fail': ['system-run-symbolic', 'emblem-system-symbolic'], 'err': ['dialog-warning-symbolic'],
+    'space': ['folder-symbolic', 'drive-harddisk-symbolic'],
+    'ts': ['document-open-recent-symbolic', 'appointment-soon-symbolic'],
+    'pl': ['text-x-generic-symbolic', 'document-save-symbolic'],
+    'pacnew': ['document-edit-symbolic', 'text-x-generic-symbolic'],
+    'integ': ['security-high-symbolic', 'emblem-ok-symbolic'], 'kern': ['computer-symbolic', 'system-run-symbolic'],
+}
+
 ITEM_CLASSES = [DlRemnants, PkgCache, Orphans, Journals, AurCache, AppCaches, Thumbnails, TrashItem,
                 FlatpakUnused, DockerItem,
                 SelfUpdate, SysUpdate, FlatpakUpdates, Firmware, Mirrors, Keyring,
                 Smart, Trim, FailedUnits, JournalErrors, DiskSpace,
                 TimeshiftItem, PkgList,
                 Pacnew, Integrity, Kernels]
+for _c in ITEM_CLASSES:
+    _c.sym = SYM.get(_c.id, _c.sym) + ['applications-system-symbolic']
 
 
 # ============================================================================
@@ -2177,49 +2248,75 @@ class ItemRow(Gtk.ListBoxRow):
         item.row = self
         self.set_activatable(False)
         self.set_selectable(False)
-        g = Gtk.Grid(column_spacing=14)
-        for m in ('start', 'end'):
-            getattr(g, f'set_margin_{m}')(14)
-        g.set_margin_top(12)
-        g.set_margin_bottom(12)
+        self._table_key = None
+        g = Gtk.Grid(column_spacing=16)
+        g.set_margin_start(20)
+        g.set_margin_end(20)
+        g.set_margin_top(16)
+        g.set_margin_bottom(16)
         col = 0
         self.check = None
         if item.selectable:
             self.check = Gtk.CheckButton()
-            self.check.set_valign(Gtk.Align.CENTER)
+            self.check.set_valign(Gtk.Align.START)
+            self.check.set_margin_top(12)
             self.check.set_tooltip_text('Inclure dans « Nettoyer la sélection »')
             self.check.connect('toggled', self._toggled)
             g.attach(self.check, 0, 0, 1, 1)
             col = 1
-        self.icon = icon(item.icons, 40)
-        self.icon.set_valign(Gtk.Align.START)
-        g.attach(self.icon, col, 0, 1, 1)
+        self.tile = tone_tile(item.sym)
+        g.attach(self.tile, col, 0, 1, 1)
 
-        mid = vbox(3)
+        mid = vbox(5)
         mid.set_hexpand(True)
-        top = hbox(8)
+        top = hbox(10)
         self.title_l = label(item.title, css=('item-title',))
         top.pack_start(self.title_l, False, False, 0)
         self.chips = hbox(6)
         top.pack_start(self.chips, False, False, 0)
         mid.pack_start(top, False, False, 0)
-        self.desc_l = label('', css=('dim-label',), wrap=True, max_chars=80)
+        self.desc_l = label('', css=('dim-label',), wrap=True, max_chars=90)
         mid.pack_start(self.desc_l, False, False, 0)
-        meta = hbox(10)
-        self.value_l = label('', css=('value',))
+        self.value_l = label('', css=('value',), wrap=True, max_chars=90)
         self.value_l.set_no_show_all(True)
-        meta.pack_start(self.value_l, False, False, 0)
+        mid.pack_start(self.value_l, False, False, 0)
+
+        self.run_box = vbox(4)
+        self.run_box.set_no_show_all(True)
+        self.pbar = Gtk.ProgressBar()
+        self.pbar.set_pulse_step(0.06)
+        self.pbar.set_size_request(380, -1)
+        self.pbar.set_halign(Gtk.Align.START)
+        self.status_l = label('', css=('status-mono',))
+        self.status_l.set_ellipsize(Pango.EllipsizeMode.END)
+        self.status_l.set_max_width_chars(80)
+        self.run_box.pack_start(self.pbar, False, False, 2)
+        self.run_box.pack_start(self.status_l, False, False, 0)
+        mid.pack_start(self.run_box, False, False, 0)
+
+        self.table = Gtk.Grid(column_spacing=28)
+        self.table.set_halign(Gtk.Align.START)
+        self.table.set_no_show_all(True)
+        mid.pack_start(self.table, False, False, 2)
+
+        links = hbox(16)
         self.det_btn = Gtk.Button(label='Détails')
-        self.det_btn.set_relief(Gtk.ReliefStyle.NONE)
         self.det_btn.get_style_context().add_class('link-btn')
         self.det_btn.set_no_show_all(True)
         self.det_btn.connect('clicked', self._toggle_details)
-        meta.pack_start(self.det_btn, False, False, 0)
-        mid.pack_start(meta, False, False, 0)
+        links.pack_start(self.det_btn, False, False, 0)
+        self.cmd_btn = Gtk.Button(label='Voir la commande')
+        self.cmd_btn.get_style_context().add_class('link-btn')
+        self.cmd_btn.set_no_show_all(True)
+        self.cmd_btn.connect('clicked', self._toggle_cmd)
+        links.pack_start(self.cmd_btn, False, False, 0)
+        mid.pack_start(links, False, False, 0)
+        self.cmd_rev = Gtk.Revealer()
+        self.cmd_rev.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
         self.cmd_l = label('', css=('cmd',), wrap=True, selectable=True)
-        self.cmd_l.set_no_show_all(True)
         self.cmd_l.set_halign(Gtk.Align.START)
-        mid.pack_start(self.cmd_l, False, False, 2)
+        self.cmd_rev.add(self.cmd_l)
+        mid.pack_start(self.cmd_rev, False, False, 0)
         self.det_rev = Gtk.Revealer()
         self.det_rev.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
         self.det_l = label('', css=('details',), wrap=True, selectable=True)
@@ -2227,8 +2324,8 @@ class ItemRow(Gtk.ListBoxRow):
         mid.pack_start(self.det_rev, False, False, 2)
         g.attach(mid, col + 1, 0, 1, 1)
 
-        right = hbox(10)
-        right.set_valign(Gtk.Align.CENTER)
+        right = hbox(12)
+        right.set_valign(Gtk.Align.START)
         self.amount_box = vbox(0)
         self.amount_box.set_no_show_all(True)
         self.amount_l = label('', css=('amount',), xalign=1)
@@ -2236,10 +2333,7 @@ class ItemRow(Gtk.ListBoxRow):
         self.amount_box.pack_start(self.amount_l, False, False, 0)
         self.amount_box.pack_start(self.amount_s, False, False, 0)
         right.pack_start(self.amount_box, False, False, 0)
-        self.spinner = Gtk.Spinner()
-        self.spinner.set_no_show_all(True)
-        right.pack_start(self.spinner, False, False, 0)
-        self.btn_box = hbox(6)
+        self.btn_box = hbox(8)
         right.pack_start(self.btn_box, False, False, 0)
         g.attach(right, col + 2, 0, 1, 1)
         self.add(g)
@@ -2254,19 +2348,55 @@ class ItemRow(Gtk.ListBoxRow):
         self.item.open = not self.item.open
         self.update()
 
+    def _toggle_cmd(self, _b):
+        self.item.cmd_open = not self.item.cmd_open
+        self.update()
+
+    def tick(self, status):
+        self.pbar.pulse()
+        if self.status_l.get_text() != status:
+            self.status_l.set_text(status)
+
+    def _fill_table(self, table):
+        key = json.dumps(table, ensure_ascii=False)
+        if key == self._table_key:
+            return
+        self._table_key = key
+        clear(self.table)
+        for c, name in enumerate(table.get('cols', [])):
+            self.table.attach(label(name, css=('th',)), c, 0, 1, 1)
+        for r, row in enumerate(table.get('rows', []), 1):
+            for c, cell in enumerate(row):
+                text, cls = (cell if isinstance(cell, (list, tuple)) else (cell, ''))
+                lab = label(str(text), css=('td',) + ((cls,) if cls else ()), selectable=True)
+                self.table.attach(lab, c, r, 1, 1)
+        for w in self.table.get_children():
+            w.show()
+
     def update(self):
         it, st, win = self.item, self.item.state, self.item.win
         avail = it.available
+        runner = win.runner
+        running = it.busy and runner.busy
         clear(self.chips)
+        kind = None
         if not avail:
             self.chips.pack_start(chip('off', 'non installé'), False, False, 0)
         elif it.probing and st.get('chip') is None:
             self.chips.pack_start(chip('info', 'Analyse…'), False, False, 0)
         elif st.get('chip'):
+            kind = st['chip'][0]
             self.chips.pack_start(chip(*st['chip']), False, False, 0)
-        if it.done_msg:
+        if running:
+            asked = runner.cancel_req
+            self.chips.pack_start(chip('warn' if asked else 'info', 'Arrêt en cours' if asked else 'En cours'),
+                                  False, False, 0)
+        elif it.done_msg:
             self.chips.pack_start(chip(*it.done_msg), False, False, 0)
         self.chips.show_all()
+        set_tone(self.tile, 'off' if not avail else ('info' if running else (kind or 'off')))
+        ctx = self.get_style_context()
+        (ctx.add_class if running else ctx.remove_class)('running')
 
         desc = it.desc
         if not avail:
@@ -2280,13 +2410,28 @@ class ItemRow(Gtk.ListBoxRow):
         self.value_l.set_text(val or '')
         self.value_l.set_visible(bool(val))
 
+        self.run_box.set_visible(running)
+        if running:
+            self.pbar.show()
+            self.status_l.show()
+            self.status_l.set_text(runner.last_line or runner.cur_label or 'En cours…')
+
+        table = st.get('table') if avail else None
+        if table and table.get('rows'):
+            self._fill_table(table)
+            self.table.show()
+        else:
+            self.table.hide()
+
         hint = it.cmd_hint()
         self.cmd_l.set_text(hint)
-        self.cmd_l.set_visible(bool(hint))
+        self.cmd_btn.set_visible(bool(hint))
+        self.cmd_btn.set_label('Masquer la commande' if it.cmd_open else 'Voir la commande')
+        self.cmd_rev.set_reveal_child(bool(hint) and it.cmd_open)
 
         det = st.get('details') or []
         self.det_btn.set_visible(bool(det) and avail)
-        self.det_btn.set_label('Masquer' if it.open else 'Détails')
+        self.det_btn.set_label('Masquer le détail' if it.open else f'Détails ({len(det)})')
         self.det_l.set_text('\n'.join(det))
         self.det_rev.set_reveal_child(bool(det) and it.open and avail)
 
@@ -2299,7 +2444,7 @@ class ItemRow(Gtk.ListBoxRow):
         self.amount_l.set_visible(bool(show_amt))
         self.amount_s.set_visible(bool(show_amt))
 
-        busy = win.runner.busy
+        busy = runner.busy
         if self.check is not None:
             self.check.handler_block_by_func(self._toggled)
             self.check.set_active(it.selected)
@@ -2307,22 +2452,20 @@ class ItemRow(Gtk.ListBoxRow):
             self.check.set_sensitive(avail and bool(st.get('todo')) and not busy)
 
         clear(self.btn_box)
-        if it.busy:
-            self.spinner.show()
-            self.spinner.start()
-            self.btn_box.pack_start(label('En cours…', css=('dim-label',)), False, False, 0)
-            if win.runner.busy:
-                asked = win.runner.cancel_req
-                b = button('Arrêt en cours…' if asked else 'Arrêter', icon_name='process-stop-symbolic')
-                b.set_tooltip_text('Arrêter cette opération (Échap)')
-                b.set_sensitive(not asked)
-                b.connect('clicked', lambda _b: win.stop_current())
-                self.btn_box.pack_start(b, False, False, 0)
+        if running:
+            asked = runner.cancel_req
+            b = button('Arrêt en cours…' if asked else 'Arrêter', style=None if asked else 'destructive-action',
+                       icon_name='process-stop-symbolic')
+            b.set_tooltip_text('Arrêter cette opération (Échap)')
+            b.set_sensitive(not asked)
+            b.connect('clicked', lambda _b: win.stop_current())
+            self.btn_box.pack_start(b, False, False, 0)
+        elif it.busy:
+            self.btn_box.pack_start(label('En attente…', css=('dim-label',)), False, False, 0)
         else:
-            self.spinner.stop()
-            self.spinner.hide()
             for a in it.get_actions():
-                b = button(a.label, style=a.style or ('destructive-action' if a.destructive else None), lock=a.lock)
+                b = button(a.label, style=a.style or ('destructive-action' if a.destructive else None),
+                           lock=a.lock and not win.session.ok)
                 b.set_sensitive(not busy and not (a.needs_todo and not st.get('todo')))
                 b.connect('clicked', lambda _b, act=a: it.trigger(act))
                 self.btn_box.pack_start(b, False, False, 0)
@@ -2368,11 +2511,8 @@ class ItemsPage:
             head.pack_start(self.clean_btn, False, False, 0)
         inner.pack_start(head, False, False, 0)
         if section == 'updates':
-            self.tip = Gtk.InfoBar()
-            self.tip.set_message_type(Gtk.MessageType.INFO)
-            self.tip.get_content_area().add(label('Conseil : crée un instantané Timeshift avant une grosse mise à jour '
-                                                  '(section Sauvegarde).', wrap=True))
-            inner.pack_start(self.tip, False, False, 0)
+            inner.pack_start(label('Conseil : crée un instantané Timeshift avant une grosse mise à jour '
+                                   '(section Sauvegarde).', css=('banner', 'info'), wrap=True), False, False, 0)
         lb = boxed_list()
         for it in win.items.values():
             if it.section == section:
@@ -2383,7 +2523,7 @@ class ItemsPage:
     def update(self):
         if self.clean_btn:
             tot, n = self.win.selection_total()
-            self.clean_btn.set_label('Nettoyer la sélection' + (f' · {fmt_size(tot)}' if tot else ''))
+            self.clean_btn.set_label('Nettoyer la sélection' + (f' ({fmt_size(tot)})' if tot else ''))
             self.clean_btn.set_sensitive(n > 0 and not self.win.runner.busy)
 
 
@@ -2395,10 +2535,8 @@ class AboutPage:
         self.widget, inner = scrolled_page()
         hero = hbox(22)
         hero.get_style_context().add_class('card')
-        img = Gtk.Image.new_from_icon_name('applications-system', Gtk.IconSize.DIALOG)
-        img.set_pixel_size(96)
-        img.set_valign(Gtk.Align.START)
-        hero.pack_start(img, False, False, 0)
+        hero.pack_start(tone_tile(['applications-system-symbolic', 'preferences-system-symbolic'], 'done',
+                                  size=88, icon_size=44, big=True), False, False, 0)
         col = vbox(6)
         col.pack_start(label('Maintenance', css=('about-name',)), False, False, 0)
         self.ver_l = label('', css=('about-version',), selectable=True)
@@ -2414,7 +2552,7 @@ class AboutPage:
             lk.set_tooltip_text(uri)
             links.pack_start(lk, False, False, 0)
         col.pack_start(links, False, False, 0)
-        col.pack_start(label('Licence MIT · © 2026 TheWorms', css=('dim-label', 'small')), False, False, 0)
+        col.pack_start(label('Licence MIT, © 2026 TheWorms', css=('dim-label', 'small')), False, False, 0)
         hero.pack_start(col, True, True, 0)
         inner.pack_start(hero, False, False, 0)
 
@@ -2448,161 +2586,233 @@ class AboutPage:
         st = it.state
         pkg = st.get('ver')
         self.ver_l.set_text(f'Version {VERSION}' + (f' · paquet {PKG_NAME} {pkg}' if pkg else ''))
+        cls = 'info-text'
         if it.probing:
-            txt = '<span foreground="#3d82c8">Recherche d’une nouvelle version…</span>'
+            txt = 'Recherche d’une nouvelle version…'
         elif st.get('new'):
             rv = st.get('remote_ver')
-            txt = (f'<span foreground="#3d82c8"><b>Nouvelle version {GLib.markup_escape_text(rv) + " " if rv else ""}'
-                   'disponible</b></span> : clique sur « Mettre à jour » ci-dessous.')
+            txt = f'Nouvelle version {rv + " " if rv else ""}disponible : clique sur « Mettre à jour » ci-dessous.'
         elif st.get('standalone'):
-            txt = '<span foreground="#c07a12">Copie hors paquet : pas de mise à jour automatique.</span>'
+            txt, cls = 'Copie hors paquet : pas de mise à jour automatique.', 'warn-text'
         elif st.get('older'):
-            txt = (f'<span foreground="#c07a12"><b>GitHub a encore la version {GLib.markup_escape_text(st["remote_ver"])}'
-                   '</b></span> : tes derniers changements n’y sont pas encore poussés.')
+            txt, cls = (f'GitHub a encore la version {st["remote_ver"]} : tes derniers changements n’y sont pas '
+                        'encore poussés.'), 'warn-text'
         elif (st.get('chip') or ('', ''))[0] == 'ok':
-            txt = '<span foreground="#3a9a52"><b>✓ Tu as la dernière version.</b></span>'
+            txt, cls = 'Tu as la dernière version.', 'ok-text'
         else:
-            txt = GLib.markup_escape_text((st.get('chip') or ('', ''))[1])
-        self.state_l.set_markup(txt)
+            txt, cls = (st.get('chip') or ('', ''))[1], 'dim-label'
+        ctx = self.state_l.get_style_context()
+        for k in ('info-text', 'warn-text', 'ok-text', 'dim-label'):
+            ctx.remove_class(k)
+        ctx.add_class(cls)
+        self.state_l.set_text(txt)
 
 
 class OverviewPage:
     def __init__(self, win):
         self.win = win
         self.widget, inner = scrolled_page()
-        self.head = page_header('Vue d’ensemble', '')
-        inner.pack_start(self.head, False, False, 0)
-        self.sub = self.head.get_children()[1]
-        self.tiles = Gtk.FlowBox()
-        self.tiles.set_selection_mode(Gtk.SelectionMode.NONE)
-        self.tiles.set_min_children_per_line(2)
-        self.tiles.set_max_children_per_line(5)
-        self.tiles.set_column_spacing(12)
-        self.tiles.set_row_spacing(12)
-        self.tiles.set_homogeneous(True)
-        inner.pack_start(self.tiles, False, False, 0)
-        inner.pack_start(label('À faire', css=('section-title',)), False, False, 4)
+        inner.set_spacing(18)
+        head = vbox(6)
+        self.h1 = label('', css=('hero-title',), wrap=True)
+        self.lead = label('', css=('hero-text',), wrap=True, max_chars=86)
+        head.pack_start(self.h1, False, False, 0)
+        head.pack_start(self.lead, False, False, 0)
+        inner.pack_start(head, False, False, 0)
+        self.band = hbox(0)
+        self.band.set_homogeneous(True)
+        self.band.get_style_context().add_class('band')
+        inner.pack_start(self.band, False, False, 0)
+        inner.pack_start(label('À faire', css=('section-title',)), False, False, 6)
         self.todo = boxed_list()
         inner.pack_start(self.todo, False, False, 0)
         self.widget.show_all()
 
-    def _tile(self, section, icon_names, title, big, sub, kind, frac=None):
+    def _seg(self, section, title, value, sub, tone, frac, pos):
         b = Gtk.Button()
-        b.get_style_context().add_class('tile')
-        b.get_style_context().add_class(kind)
-        box = vbox(3)
-        top = hbox(6)
-        top.pack_start(symbolic(icon_names, 16), False, False, 0)
-        top.pack_start(label(title, css=('dim-label', 'small')), False, False, 0)
-        box.pack_start(top, False, False, 0)
-        box.pack_start(label(big, css=('tile-big',)), False, False, 0)
-        box.pack_start(label(sub, css=('dim-label', 'small'), wrap=True), False, False, 0)
-        if frac is not None:
-            pb = Gtk.ProgressBar()
-            pb.set_fraction(max(0.0, min(1.0, frac)))
-            box.pack_start(pb, False, False, 4)
-        b.add(box)
+        b.set_relief(Gtk.ReliefStyle.NONE)
+        ctx = b.get_style_context()
+        ctx.add_class('seg')
+        if pos:
+            ctx.add_class(pos)
+        col = vbox(0)
+        txt = vbox(2)
+        txt.set_margin_start(20)
+        txt.set_margin_end(20)
+        txt.set_margin_top(16)
+        txt.set_margin_bottom(14)
+        txt.pack_start(label(title, css=('seg-label',)), False, False, 0)
+        txt.pack_start(label(value, css=('seg-value',)), False, False, 0)
+        txt.pack_start(label(sub, css=('seg-sub',), wrap=True), False, False, 0)
+        col.pack_start(txt, True, True, 0)
+        bar = Gtk.ProgressBar()
+        bar.get_style_context().add_class('segbar')
+        bar.get_style_context().add_class(tone)
+        bar.set_fraction(max(0.0, min(1.0, frac)))
+        col.pack_end(bar, False, False, 0)
+        b.add(col)
+        b.set_tooltip_text(f'Aller à : {dict((s_[0], s_[1]) for s_ in SECTIONS).get(section, "")}')
         b.connect('clicked', lambda _b: self.win.go(section))
         return b
 
     def update(self):
         win, items = self.win, self.win.items
-        today = time.strftime('%d/%m/%Y')
-        gained = win.gained()
-        self.sub.set_text(f'État de {socket.gethostname()} le {today}.' +
-                          (f' Gagné depuis l’ouverture : {fmt_size(gained)}.' if gained > 1024 ** 2 else ''))
-        clear(self.tiles)
+        host = socket.gethostname()
         total, free = disk_usage('/')
         frac = (total - free) / total if total else 0
-        dk = 'crit' if frac > 0.9 else 'warn' if frac > 0.8 else 'ok'
         rec = win.reclaim_total()
         upd = win.updates_count()
         upd_probing = items['sys'].probing
         issues = win.health_issues()
         ts = items['ts']
-        if not ts.available:
-            ts_big, ts_sub, ts_k = 'Aucun outil', 'installe Timeshift', 'warn'
-        elif ts.state.get('listed'):
-            old = time.time() - ts.state['last'] > 7 * 86400
-            ts_big, ts_sub, ts_k = ago(ts.state['last']), plural(ts.state['count'], 'instantané'), 'warn' if old else 'ok'
-        else:
-            ts_big, ts_sub, ts_k = 'Non vérifié', 'clique pour lister', 'info'
-        tiles = [
-            ('clean', ['drive-harddisk-symbolic'], 'Disque système (/)', f'{fmt_size(free)} libres',
-             f'sur {fmt_size(total)} · {round(frac * 100)} % utilisés', dk, frac),
-            ('clean', ['edit-clear-all-symbolic', 'user-trash-symbolic'], 'À nettoyer',
-             fmt_size(rec) if rec else 'Rien', 'au moins, d’après les analyses' if rec else 'tout est propre',
-             'warn' if rec > 1024 ** 3 else 'ok', None),
-            ('updates', ['software-update-available-symbolic', 'view-refresh-symbolic'], 'Mises à jour',
-             '…' if upd_probing else str(upd), 'recherche en cours' if upd_probing else ('disponibles' if upd else 'système à jour'),
-             'info' if upd or upd_probing else 'ok', None),
-            ('health', ['utilities-system-monitor-symbolic'], 'Santé',
-             plural(issues, 'point') if issues else 'Bonne', 'à vérifier' if issues else 'aucun problème détecté',
-             'crit' if issues else 'ok', None),
-            ('backup', ['document-open-recent-symbolic'], 'Dernier instantané', ts_big, ts_sub, ts_k, None),
-        ]
-        for t in tiles:
-            self.tiles.add(self._tile(*t))
-        self.tiles.show_all()
+        reboot = bool(items['kern'].state.get('reboot'))
+        pn = items['pacnew'].state.get('count', 0)
+        err_n = items['err'].state.get('count', 0)
+        crit = any(it.section == 'health' and it.available and (it.state.get('chip') or ('',))[0] == 'crit'
+                   for it in items.values())
+        ts_old = ts.available and ts.state.get('listed') and time.time() - ts.state['last'] > 7 * 86400
 
+        # Phrase de bilan
+        parts = []
+        if rec > 50 * 1024 ** 2:
+            parts.append(f'{fmt_size(rec)} à libérer')
+        if upd:
+            parts.append(f'{plural(upd, "mise à jour", "mises à jour")} à installer')
+        if reboot:
+            parts.append('un redémarrage pour le nouveau noyau')
+        if pn:
+            parts.append(f'{plural(pn, "fichier")} de configuration à fusionner')
+        if items['fail'].state.get('count'):
+            parts.append(f'{plural(items["fail"].state["count"], "service")} en échec')
+        if err_n:
+            parts.append('des erreurs dans le journal à regarder')
+        if not ts.available:
+            parts.append('aucune sauvegarde du système')
+        elif ts_old:
+            parts.append('un instantané à refaire')
+        if crit:
+            self.h1.set_text(f'{host} a besoin d’attention')
+        elif not parts:
+            self.h1.set_text(f'{host} est au propre')
+        elif len(parts) <= 3:
+            self.h1.set_text(f'{host} va bien')
+        else:
+            self.h1.set_text(f'{host} a besoin d’un peu d’entretien')
+        if parts:
+            joined = ', '.join(parts[:-1]) + ' et ' + parts[-1] if len(parts) > 1 else parts[0]
+            lead = f'Il reste {joined}.'
+        else:
+            lead = 'Rien à faire : tout est propre et à jour.'
+        if any(it.probing for it in items.values()):
+            lead += ' Analyse en cours…'
+        g = win.gained()
+        if g > 1024 ** 2:
+            lead += f' Gagné depuis l’ouverture : {fmt_size(g)}.'
+        self.lead.set_text(lead)
+
+        # Bandeau
+        clear(self.band)
+        dk = 'crit' if frac > 0.9 else 'warn' if frac > 0.8 else 'ok'
+        if not ts.available:
+            ts_v, ts_s, ts_k = 'Aucun outil', 'installe Timeshift', 'warn'
+        elif ts.state.get('listed'):
+            ts_v, ts_s, ts_k = ago(ts.state['last']), plural(ts.state['count'], 'instantané'), 'warn' if ts_old else 'ok'
+        else:
+            ts_v, ts_s, ts_k = 'Non vérifiée', 'liste les instantanés', 'info'
+        if upd_probing:
+            up_v, up_s, up_k = '…', 'recherche en cours', 'info'
+        elif upd:
+            up_v, up_s, up_k = plural(upd, 'disponible'), 'système, AUR et Flatpak', 'info'
+        else:
+            up_v, up_s, up_k = 'À jour', 'redémarrage conseillé' if reboot else 'système, AUR et Flatpak', \
+                'warn' if reboot else 'ok'
+        if err_n and issues == 1:
+            he_v, he_s = plural(err_n, 'erreur'), 'dans le journal'
+        elif issues:
+            he_v, he_s = plural(issues, 'point à voir', 'points à voir'), 'disques, services, journal'
+        else:
+            he_v, he_s = 'Bonne', 'aucun problème détecté'
+        segs = [
+            ('clean', 'Disque système', f'{fmt_size(free)} libres', f'sur {fmt_size(total)}', dk, frac),
+            ('clean', 'Nettoyage', fmt_size(rec) if rec > 50 * 1024 ** 2 else 'Propre',
+             'à libérer' if rec > 50 * 1024 ** 2 else 'rien à nettoyer',
+             'warn' if rec > 1024 ** 3 else ('info' if rec > 50 * 1024 ** 2 else 'ok'), 1),
+            ('updates', 'Mises à jour', up_v, up_s, up_k, 1),
+            ('health', 'Santé', he_v, he_s, 'crit' if crit else ('warn' if issues else 'ok'), 1),
+            ('backup', 'Sauvegarde', ts_v, ts_s, ts_k, 1),
+        ]
+        for n, sg in enumerate(segs):
+            self.band.pack_start(self._seg(*sg, 'first' if n == 0 else ('last' if n == len(segs) - 1 else '')),
+                                 True, True, 0)
+        self.band.show_all()
+
+        # À faire
         clear(self.todo)
         todo = []
         tot, n = win.selection_total()
         if n:
-            todo.append((['edit-clear-all', 'user-trash-full'], f'Libérer {fmt_size(tot)}' if tot else 'Nettoyer la sélection',
-                         'Selon ta sélection dans Nettoyage.', 'Nettoyer la sélection', win.clean_selection, 'suggested-action'))
+            todo.append((['edit-clear-all-symbolic', 'user-trash-symbolic'], 'warn' if tot > 1024 ** 3 else 'info',
+                         f'Libérer {fmt_size(tot)}' if tot else 'Nettoyer la sélection',
+                         'Selon ta sélection dans Nettoyage.', 'Nettoyer la sélection', win.clean_selection,
+                         'suggested-action'))
         if not items['pkg'].available:
-            todo.append((['package-x-generic'], 'Installer pacman-contrib',
+            todo.append((['package-x-generic-symbolic'], 'warn', 'Installer pacman-contrib',
                          'Nécessaire pour le cache des paquets (paccache) et la recherche des mises à jour (checkupdates).',
                          'Installer', lambda: items['pkg'].trigger(items['pkg'].get_actions()[0]), 'suggested-action'))
         if items['self'].state.get('new'):
             rv = items['self'].state.get('remote_ver')
-            todo.append((['applications-system'], f'Nouvelle version de Maintenance{" " + rv if rv else ""}',
+            todo.append((['software-update-available-symbolic'], 'done',
+                         f'Nouvelle version de Maintenance{" " + rv if rv else ""}',
                          'Tu as poussé des changements sur GitHub : l’application peut se mettre à jour.',
                          'Voir', lambda: win.go('about'), 'suggested-action'))
-        sys_n = upd
-        if sys_n:
-            todo.append((['system-software-update'], f'{plural(sys_n, "mise à jour", "mises à jour")} disponible{"s" if sys_n > 1 else ""}',
+        if upd:
+            todo.append((['software-update-available-symbolic'], 'info',
+                         f'{plural(upd, "mise à jour", "mises à jour")} disponible{"s" if upd > 1 else ""}',
                          'Système, AUR et Flatpak.', 'Voir', lambda: win.go('updates'), None))
-        if items['kern'].state.get('reboot'):
-            todo.append((['system-reboot', 'view-refresh'], 'Redémarrer l’ordinateur',
+        if reboot:
+            todo.append((['system-reboot-symbolic', 'view-refresh-symbolic'], 'warn', 'Redémarrer l’ordinateur',
                          'Le noyau a été mis à jour : il sera utilisé au prochain démarrage.', None, None, None))
         if items['fail'].state.get('count'):
-            todo.append((['dialog-error'], plural(items['fail'].state['count'], 'service') + ' en échec',
+            todo.append((['dialog-error-symbolic'], 'crit', plural(items['fail'].state['count'], 'service') + ' en échec',
                          (items['fail'].state.get('details') or [''])[0], 'Voir', lambda: win.go('health'), None))
         tr = items['trim']
         if tr.state.get('enabled') is False and not tr.state.get('no_ssd'):
-            todo.append((['drive-harddisk-solidstate', 'drive-harddisk'], 'TRIM hebdomadaire désactivé',
-                         'Garde les performances du SSD dans la durée.', 'Activer',
+            todo.append((['drive-harddisk-solidstate-symbolic', 'drive-harddisk-symbolic'], 'warn',
+                         'TRIM hebdomadaire désactivé', 'Garde les performances du SSD dans la durée.', 'Activer',
                          lambda: tr.trigger(tr.get_actions()[0]), None))
-        if items['pacnew'].state.get('count'):
-            todo.append((['text-x-generic'], plural(items['pacnew'].state['count'], 'fichier') + ' de configuration à fusionner',
+        if pn:
+            todo.append((['document-edit-symbolic'], 'warn', f'Fusionner {plural(pn, "fichier")} de configuration',
                          'Fichiers .pacnew et .pacsave laissés par pacman.', 'Gérer', items['pacnew'].manage, None))
+        if err_n:
+            todo.append((['dialog-warning-symbolic'], 'warn', 'Regarder les erreurs du journal',
+                         f'{plural(err_n, "message")} d’erreur depuis le dernier démarrage.', 'Voir',
+                         lambda: win.go('health'), None))
         if not ts.available:
-            todo.append((['timeshift', 'document-revert'], 'Aucune sauvegarde du système',
+            todo.append((['document-open-recent-symbolic'], 'warn', 'Aucune sauvegarde du système',
                          'Timeshift permet de revenir en arrière après une mise à jour qui pose problème.',
                          'Installer Timeshift', lambda: ts.trigger(ts.get_actions()[0]), None))
+        elif ts_old:
+            todo.append((['document-open-recent-symbolic'], 'warn', 'Créer un instantané',
+                         f'Le dernier instantané Timeshift date de {ago(ts.state["last"])}.', 'Voir',
+                         lambda: win.go('backup'), None))
         if not todo:
-            row = Gtk.ListBoxRow()
-            box = vbox(6)
-            box.set_margin_top(30)
-            box.set_margin_bottom(30)
-            img = symbolic(['emblem-ok-symbolic', 'object-select-symbolic'], 48)
-            img.get_style_context().add_class('dim-label')
-            box.pack_start(img, False, False, 0)
-            box.pack_start(label('<b>Tout est en ordre</b>', markup=True, xalign=0.5), False, False, 0)
-            row.add(box)
-            self.todo.add(row)
-        for icons_, title, sub, btn_label, cb, style in todo:
+            todo.append((['emblem-ok-symbolic', 'object-select-symbolic'], 'ok', 'Rien à faire',
+                         'Tout est propre et à jour.', None, None, None))
+        for icons_, tone, title, sub, btn_label, cb, style in todo:
             row = Gtk.ListBoxRow()
             row.set_activatable(False)
-            g = hbox(14)
-            for m in ('start', 'end', 'top', 'bottom'):
-                getattr(g, f'set_margin_{m}')(12 if m in ('top', 'bottom') else 14)
-            g.pack_start(icon(icons_, 36), False, False, 0)
+            g = hbox(16)
+            g.set_margin_start(20)
+            g.set_margin_end(20)
+            g.set_margin_top(14)
+            g.set_margin_bottom(14)
+            tile = tone_tile(icons_, tone)
+            tile.set_valign(Gtk.Align.CENTER)
+            g.pack_start(tile, False, False, 0)
             col = vbox(2)
+            col.set_valign(Gtk.Align.CENTER)
             col.pack_start(label(title, css=('item-title',)), False, False, 0)
-            col.pack_start(label(sub, css=('dim-label',), wrap=True, max_chars=80), False, False, 0)
+            col.pack_start(label(sub, css=('dim-label',), wrap=True, max_chars=90), False, False, 0)
             g.pack_start(col, True, True, 0)
             if btn_label:
                 b = button(btn_label, style=style)
@@ -2962,8 +3172,7 @@ class DupsPage:
             return
         tot = sum(s for _, s in sel)
         shown = [p.replace(HOME, '~', 1) for p, _ in sel[:12]] + ([f'… et {len(sel) - 12} autres'] if len(sel) > 12 else [])
-        txt = ('Mode simulation : les fichiers restent en place. ' if self.win.sim else
-               'Ils resteront récupérables dans la corbeille. ') + f'Environ {fmt_size(tot)}.'
+        txt = f'Ils resteront récupérables dans la corbeille. Environ {fmt_size(tot)}.'
         if not confirm(self.win, f'Mettre {plural(len(sel), "fichier")} à la corbeille ?', txt,
                        ok_label='Mettre à la corbeille', destructive=True, items=shown):
             return
@@ -2981,12 +3190,11 @@ class DupsPage:
                     log(f'  échec : {p} ({e.message})', 'e')
             log(f'  {plural(ok, "fichier")} mis à la corbeille, {plural(fail, "échec")}.', 'h')
 
-        def done(ok, sim):
-            if not sim:
-                for g in self.groups:
-                    g['files'] = [f for f in g['files'] if os.path.exists(f['p'])]
-                self.groups = [g for g in self.groups if len(g['files']) > 1]
-                self.win.items['tr'].refresh()
+        def done(ok):
+            for g in self.groups:
+                g['files'] = [f for f in g['files'] if os.path.exists(f['p'])]
+            self.groups = [g for g in self.groups if len(g['files']) > 1]
+            self.win.items['tr'].refresh()
             self.rebuild()
             self.win.after_action()
 
@@ -3155,18 +3363,15 @@ class AppsPage:
         tot = sum(a['size'] for a in chosen)
         names = [a['pkg'] for a in chosen]
         txt = f'Environ {fmt_size(tot)}. Les dépendances devenues inutiles sont retirées aussi.'
-        if self.win.sim:
-            txt += ' Mode simulation : rien ne sera désinstallé.'
         if not confirm(self.win, f'Désinstaller {plural(len(chosen), "application")} ?', txt, ok_label='Désinstaller',
                        destructive=True, items=[f'{a["name"]} ({a["pkg"]})' for a in chosen]):
             return
 
-        def done(ok, sim):
-            if not sim:
-                self.sel.clear()
-                self.load()
-                for rid in ('orph', 'pkg'):
-                    self.win.items[rid].refresh()
+        def done(ok):
+            self.sel.clear()
+            self.load()
+            for rid in ('orph', 'pkg'):
+                self.win.items[rid].refresh()
             self.win.after_action()
 
         self.win.runner.start(f'Applications · désinstallation de {", ".join(names)}',
@@ -3299,7 +3504,7 @@ class SoftPage:
     def install(self, s):
         act = install_action(s['pkg'])
 
-        def done(ok, sim):
+        def done(ok):
             self.load()
             for it in self.win.items.values():
                 if it.install_pkg == s['pkg'] or it.requires == s['pkg']:
@@ -3328,9 +3533,9 @@ class Journal:
         head.get_style_context().add_class('journal-head')
         head.pack_start(symbolic(['utilities-terminal-symbolic'], 16), False, False, 0)
         head.pack_start(label('<b>Journal d’activité</b>', markup=True), False, False, 0)
-        for text, tip, cb in (('Masquer', 'Cacher le journal (le bouton en haut le réaffiche)',
+        for text, tip, cb in (('Réduire', 'Réduire le journal à sa dernière ligne',
                                lambda _b: GLib.idle_add(win.show_journal, False)),
-                              ('Effacer', 'Vider le journal', lambda _b: self.clear()),
+                              ('Vider', 'Vider le journal d’activité de l’application', lambda _b: self.clear()),
                               ('Copier', 'Copier la sélection, ou tout le journal si rien n’est sélectionné',
                                self.copy)):
             b = Gtk.Button(label=text)
@@ -3361,6 +3566,30 @@ class Journal:
         self.widget.pack_start(sw, True, True, 0)
         self.widget.show_all()
 
+        # Barre réduite : la dernière ligne et un bouton pour rouvrir le journal
+        self.bar = hbox(10)
+        self.bar.get_style_context().add_class('jbar')
+        self.bar.pack_start(symbolic(['utilities-terminal-symbolic'], 16), False, False, 0)
+        self.last_l = label('Le journal est vide.', css=('jl-d',))
+        self.last_l.set_ellipsize(Pango.EllipsizeMode.END)
+        self.bar.pack_start(self.last_l, True, True, 0)
+        ob = Gtk.Button(label='Ouvrir le journal')
+        ob.connect('clicked', lambda _b: win.show_journal(True))
+        self.bar.pack_start(ob, False, False, 0)
+        self.bar.set_no_show_all(True)
+        for c in self.bar.get_children():
+            c.show_all()
+
+    def set_last(self, text, tag):
+        if not text.strip():
+            return
+        ctx = self.last_l.get_style_context()
+        for k in ('h', 's', 'e', 'c', 'd'):
+            ctx.remove_class('jl-' + k)
+        if tag:
+            ctx.add_class('jl-' + tag)
+        self.last_l.set_text(text.strip())
+
     def add(self, text, tag=None):
         it = self.buf.get_end_iter()
         if tag:
@@ -3372,6 +3601,7 @@ class Journal:
             self.buf.delete(self.buf.get_start_iter(), self.buf.get_iter_at_line(extra))
         self.buf.move_mark(self.end, self.buf.get_end_iter())
         self.view.scroll_mark_onscreen(self.end)
+        self.set_last(text, tag)
         return False
 
     def log(self, text, tag=None):
@@ -3379,6 +3609,7 @@ class Journal:
 
     def clear(self):
         self.buf.set_text('')
+        self.last_l.set_text('Le journal est vide.')
 
     def copy(self, btn=None):
         sel = self.buf.get_selection_bounds()
@@ -3414,9 +3645,9 @@ class SudoSession:
 
     # --- démarrage de l'assistant
     def start(self):
+        """Le mot de passe n'est pas demandé à l'ouverture : seulement quand on clique sur
+        « Droits non accordés » ou qu'on lance une action administrateur."""
         self._serve()
-        if os.geteuid() != 0 and self.win.settings.get('mot_de_passe_au_lancement', True):
-            self.login()
 
     def login(self):
         if self.pending or self.ok:
@@ -3468,8 +3699,8 @@ class SudoSession:
         if ok:
             self.win.journal.add('Droits administrateur accordés jusqu’à la fermeture de l’application.', 'd')
         else:
-            self.win.journal.add('Droits administrateur non accordés : ils seront demandés à la première action '
-                                 '(ou clique sur le cadenas).', 's')
+            self.win.journal.add('Droits administrateur non accordés : ils seront redemandés à la prochaine action '
+                                 'administrateur, ou clique sur « Droits non accordés » en haut à droite.', 's')
         self.win.update_lock()
         return False
 
@@ -3660,60 +3891,215 @@ class SudoSession:
 # ============================================================================
 #  Fenêtre principale
 # ============================================================================
-CSS = b"""
-.page-title { font-size: 150%; font-weight: bold; }
-.section-title { font-size: 110%; font-weight: bold; }
-.dim-label { opacity: 0.72; }
-.small { font-size: 88%; }
-.item-title { font-weight: bold; }
-.value { font-weight: 500; }
-.mono { font-family: monospace; font-size: 90%; }
-list.boxed { border: 1px solid alpha(@theme_fg_color, 0.15); border-radius: 8px; background-color: @theme_base_color; }
-list.boxed > row { border-bottom: 1px solid alpha(@theme_fg_color, 0.08); }
-list.boxed > row:last-child { border-bottom-width: 0; }
-list.boxed > row.group-head { background-color: alpha(@theme_fg_color, 0.04); }
-.chip { border-radius: 10px; padding: 0px 8px; font-size: 85%; font-weight: bold; }
-.chip.ok { color: #3a9a52; background-color: rgba(58, 154, 82, 0.15); }
-.chip.warn { color: #c07a12; background-color: rgba(192, 122, 18, 0.16); }
-.chip.crit { color: #d4453f; background-color: rgba(212, 69, 63, 0.15); }
-.chip.info { color: #3d82c8; background-color: rgba(61, 130, 200, 0.15); }
-.chip.off { color: alpha(@theme_fg_color, 0.65); background-color: alpha(@theme_fg_color, 0.09); }
-.chip.done { color: @theme_selected_bg_color; background-color: alpha(@theme_selected_bg_color, 0.15); }
-.cmd { font-family: monospace; font-size: 85%; padding: 1px 6px; border-radius: 4px; background-color: alpha(@theme_fg_color, 0.07); }
-.details { font-family: monospace; font-size: 88%; padding: 8px 10px; border-radius: 6px; background-color: alpha(@theme_fg_color, 0.05); }
-.amount { font-size: 112%; font-weight: bold; }
-.toast { color: #d4453f; font-weight: bold; }
-button.link-btn { padding: 0px 4px; min-height: 0px; }
-button.link-btn label { color: @theme_selected_bg_color; font-size: 92%; }
-button.tile { background-image: none; background-color: @theme_base_color; border: 1px solid alpha(@theme_fg_color, 0.15);
-              border-left-width: 4px; border-radius: 10px; box-shadow: none; padding: 12px 14px; }
-button.tile:hover { background-color: alpha(@theme_selected_bg_color, 0.07); }
-button.tile.ok { border-left-color: #3a9a52; }
-button.tile.warn { border-left-color: #c07a12; }
-button.tile.crit { border-left-color: #d4453f; }
-button.tile.info { border-left-color: #3d82c8; }
-.tile-big { font-size: 155%; font-weight: bold; }
-.about-name { font-size: 190%; font-weight: bold; }
-.about-version { font-size: 105%; opacity: 0.8; }
-.badge { border-radius: 10px; padding: 0px 7px; font-size: 80%; font-weight: bold; }
-.badge.warn { color: #c07a12; background-color: rgba(192, 122, 18, 0.18); }
-.badge.crit { color: #d4453f; background-color: rgba(212, 69, 63, 0.16); }
-.badge.info { color: #3d82c8; background-color: rgba(61, 130, 200, 0.16); }
-row:selected .badge { color: inherit; background-color: rgba(255, 255, 255, 0.28); }
-.card { border: 1px solid alpha(@theme_fg_color, 0.15); border-radius: 10px; background-color: @theme_base_color; padding: 14px; }
-.sidebar-foot { padding: 10px 12px 12px 12px; border-top: 1px solid alpha(@theme_fg_color, 0.1); }
-.journal-head { background-color: #1f211f; color: #d9dcd6; padding: 2px 6px 2px 12px; }
-.journal-head button, .journal-head button label { color: #d9dcd6; }
-.journal-head image { color: #d9dcd6; }
-textview.journal, textview.journal text { background-color: #1f211f; color: #d9dcd6; }
+PALETTES = {
+    'sombre': {'bg': '#1A1D1F', 'head': '#202427', 'side': '#16191B', 'surface': '#222629', 'surface2': '#2C3134',
+               'line': '#33393D', 'fg': '#E6E9E7', 'dim': '#A4ADA8', 'accent': '#93BE6B', 'on_accent': '#142009',
+               'ok': '#86C98A', 'warn': '#EDB656', 'crit': '#F27A68', 'info': '#79B8EC', 'term': '#14181A',
+               'term_fg': '#D3DAD5', 'term_dim': '#8E9893', 'term_line': '#262C2F', 'hover': 'rgba(255,255,255,0.05)'},
+    'clair': {'bg': '#F3F5F4', 'head': '#E7EBE9', 'side': '#EBEFED', 'surface': '#FFFFFF', 'surface2': '#EEF2F0',
+              'line': '#D5DCD8', 'fg': '#1B211F', 'dim': '#545E59', 'accent': '#4C7D29', 'on_accent': '#FFFFFF',
+              'ok': '#2E7A38', 'warn': '#8F5B00', 'crit': '#B83A2C', 'info': '#1D69A8', 'term': '#1A1F21',
+              'term_fg': '#D3DAD5', 'term_dim': '#8E9893', 'term_line': '#2C3336', 'hover': 'rgba(0,0,0,0.045)'},
+}
+
+CSS = """
+@define-color m_accent_soft alpha(@m_accent, 0.16);
+@define-color m_ok_soft alpha(@m_ok, 0.15);
+@define-color m_warn_soft alpha(@m_warn, 0.15);
+@define-color m_crit_soft alpha(@m_crit, 0.14);
+@define-color m_info_soft alpha(@m_info, 0.14);
+@define-color m_run_bg alpha(@m_info, 0.06);
+
+window.maint, window.maint.background { background-color: @m_bg; color: @m_fg; FONTSANS }
+window.maint label { text-shadow: none; }
+window.maint list, window.maint list > row, window.maint viewport, window.maint scrolledwindow, window.maint stack,
+window.maint grid, window.maint messagedialog .dialog-vbox { color: @m_fg; }
+window.maint label selection, window.maint entry selection, window.maint textview text selection {
+  background-color: @m_accent; color: @m_on_accent; }
+window.maint tooltip { text-shadow: none; }
+
+/* Barre de titre */
+window.maint headerbar { background: @m_head; border: none; border-bottom: 1px solid @m_line; box-shadow: none;
+  color: @m_fg; min-height: 50px; padding: 0 8px; }
+window.maint headerbar:backdrop { background: @m_head; }
+window.maint headerbar .title { color: @m_fg; font-weight: 600; }
+window.maint headerbar .subtitle { color: @m_dim; opacity: 1; }
+window.maint headerbar button.titlebutton { background: transparent; border: none; box-shadow: none; color: @m_fg;
+  min-width: 28px; min-height: 28px; padding: 2px; border-radius: 999px; }
+window.maint headerbar button.titlebutton:hover { background: @m_hover; }
+
+/* Boutons */
+window.maint button { background: @m_surface2; background-image: none; color: @m_fg; border: 1px solid @m_line;
+  border-radius: 8px; box-shadow: none; text-shadow: none; -gtk-icon-shadow: none; min-height: 24px; padding: 5px 14px; }
+window.maint button:hover { background: shade(@m_surface2, 1.08); }
+window.maint button:active, window.maint button:checked { background: @m_accent_soft; border-color: @m_accent; }
+window.maint button:disabled { background: @m_surface2; border-color: @m_line; color: @m_dim; opacity: 0.55; }
+window.maint button:disabled label { color: @m_dim; }
+window.maint button label, window.maint button image { color: inherit; }
+window.maint button.suggested-action { background: @m_accent; color: @m_on_accent; border-color: @m_accent; font-weight: 600; }
+window.maint button.suggested-action:hover { background: shade(@m_accent, 1.06); }
+window.maint button.suggested-action:disabled { background: @m_accent; color: @m_on_accent; }
+window.maint button.suggested-action:disabled label { color: @m_on_accent; }
+window.maint button.destructive-action { background: @m_crit_soft; color: @m_crit; border-color: @m_crit; font-weight: 600; }
+window.maint button.destructive-action:hover { background: alpha(@m_crit, 0.22); }
+window.maint button.destructive-action:disabled label { color: @m_crit; }
+window.maint button.flat, window.maint button.m-flat { background: transparent; border-color: transparent; }
+window.maint button.flat:hover, window.maint button.m-flat:hover { background: @m_hover; }
+window.maint button.icon-btn { padding: 6px; min-width: 24px; background: @m_surface; }
+window.maint button.pill { border-radius: 999px; padding: 4px 14px 4px 10px; background: @m_surface; }
+window.maint button.pill.ok image { color: @m_ok; }
+window.maint button.pill.off image { color: @m_dim; }
+window.maint box.pill { border: 1px solid @m_line; border-radius: 999px; background: @m_surface; padding: 2px 6px 2px 12px; }
+window.maint button.link-btn { background: transparent; border: none; padding: 0 2px; min-height: 0; }
+window.maint button.link-btn label { color: @m_accent; font-size: 93%; }
+window.maint button.link-btn:hover label { text-decoration: underline; }
+window.maint button.link { background: transparent; border: none; padding: 2px 4px; }
+window.maint *:link, window.maint button.link label { color: @m_accent; }
+window.maint spinbutton button { border: none; border-left: 1px solid @m_line; border-radius: 0; background: transparent; }
+
+/* Champs */
+window.maint entry, window.maint spinbutton { background: @m_bg; background-image: none; color: @m_fg;
+  border: 1px solid @m_line; border-radius: 8px; box-shadow: none; min-height: 30px; }
+window.maint spinbutton entry { border: none; background: transparent; min-height: 0; }
+window.maint entry:focus, window.maint spinbutton:focus { border-color: @m_accent; }
+window.maint entry image { color: @m_dim; }
+
+/* Cases, interrupteurs, barres */
+window.maint check { min-width: 16px; min-height: 16px; border: 1px solid @m_dim; border-radius: 4px;
+  background: @m_surface; background-image: none; box-shadow: none; -gtk-icon-source: none; color: @m_on_accent; }
+window.maint check:checked { background: @m_accent; border-color: @m_accent;
+  -gtk-icon-source: -gtk-icontheme("object-select-symbolic"); }
+window.maint check:disabled { opacity: 0.5; }
+window.maint switch { background: @m_surface2; background-image: none; border: 1px solid @m_line; border-radius: 999px;
+  color: transparent; box-shadow: none; min-width: 40px; min-height: 20px; }
+window.maint switch image { color: transparent; -gtk-icon-source: none; }
+window.maint switch:checked { background: @m_warn; border-color: @m_warn; }
+window.maint switch slider { background: @m_dim; background-image: none; border: none; border-radius: 999px;
+  min-width: 18px; min-height: 18px; margin: 1px; box-shadow: none; }
+window.maint switch:checked slider { background: @m_surface; }
+window.maint progressbar trough { background: @m_surface2; background-image: none; border: none; border-radius: 999px;
+  min-height: 5px; min-width: 0; box-shadow: none; }
+window.maint progressbar progress { background: @m_info; background-image: none; border: none; border-radius: 999px;
+  min-height: 5px; box-shadow: none; }
+window.maint progressbar.ok progress { background: @m_ok; }
+window.maint progressbar.warn progress { background: @m_warn; }
+window.maint progressbar.crit progress { background: @m_crit; }
+window.maint progressbar.segbar trough, window.maint progressbar.segbar progress { border-radius: 0; }
+window.maint paned > separator { background: @m_line; background-image: none; min-height: 1px; min-width: 1px; }
+window.maint actionbar > revealer > box { background: @m_head; background-image: none; border-top: 1px solid @m_line;
+  box-shadow: none; color: @m_fg; }
+
+/* Menu de gauche */
+window.maint box.sidebar { background: @m_side; border-right: 1px solid @m_line; }
+window.maint list.sidebar { background: @m_side; padding: 8px 0; }
+window.maint list.sidebar > row { border-radius: 8px; margin: 1px 8px; background: transparent; color: @m_fg; }
+window.maint list.sidebar > row:hover { background: @m_hover; }
+window.maint list.sidebar > row:selected { background: @m_accent_soft; color: @m_fg; }
+window.maint list.sidebar > row:selected label { color: @m_fg; font-weight: 600; }
+window.maint list.sidebar > row image { color: @m_dim; }
+window.maint list.sidebar > row:selected image { color: @m_accent; }
+window.maint list.sidebar separator { background: @m_line; margin: 8px 16px; min-height: 1px; }
+window.maint .side-group { color: @m_dim; font-size: 86%; margin: 14px 20px 4px 20px; }
+window.maint .sidebar-foot { padding: 12px 20px 14px 20px; border-top: 1px solid @m_line; }
+window.maint .badge { border-radius: 999px; padding: 0 8px; font-size: 82%; font-weight: 600; }
+window.maint .badge.warn { color: @m_warn; background-color: @m_warn_soft; }
+window.maint .badge.crit { color: @m_crit; background-color: @m_crit_soft; }
+window.maint .badge.info { color: @m_info; background-color: @m_info_soft; }
+
+/* Pages */
+window.maint .page-title { font-size: 185%; font-weight: 600; }
+window.maint .hero-title { font-size: 245%; font-weight: 600; }
+window.maint .hero-text { font-size: 115%; color: @m_dim; }
+window.maint .section-title { font-size: 118%; font-weight: 600; }
+window.maint .dim-label { color: @m_dim; opacity: 1; }
+window.maint .small { font-size: 88%; }
+window.maint .item-title { font-weight: 600; font-size: 104%; }
+window.maint .value { font-weight: 500; }
+window.maint .mono { MONO font-size: 92%; }
+window.maint list.boxed { background: @m_surface; border: 1px solid @m_line; border-radius: 14px; }
+window.maint list.boxed > row { background: transparent; border-bottom: 1px solid @m_line; }
+window.maint list.boxed > row:last-child { border-bottom-width: 0; }
+window.maint list.boxed > row:hover { background: transparent; }
+window.maint list.boxed > row.running { background: @m_run_bg; }
+window.maint list.boxed > row.group-head { background: alpha(@m_fg, 0.04); }
+window.maint list.boxed > row.activatable:hover { background: @m_hover; }
+window.maint .chip { border-radius: 999px; padding: 1px 9px; font-size: 85%; font-weight: 600; }
+window.maint .chip.ok { color: @m_ok; background-color: @m_ok_soft; }
+window.maint .chip.warn { color: @m_warn; background-color: @m_warn_soft; }
+window.maint .chip.crit { color: @m_crit; background-color: @m_crit_soft; }
+window.maint .chip.info { color: @m_info; background-color: @m_info_soft; }
+window.maint .chip.off { color: @m_dim; background-color: @m_surface2; }
+window.maint .chip.done { color: @m_accent; background-color: @m_accent_soft; }
+window.maint box.tile { border-radius: 10px; }
+window.maint box.tile.big { border-radius: 22px; }
+window.maint box.tile.ok { background-color: @m_ok_soft; } window.maint box.tile.ok image { color: @m_ok; }
+window.maint box.tile.warn { background-color: @m_warn_soft; } window.maint box.tile.warn image { color: @m_warn; }
+window.maint box.tile.crit { background-color: @m_crit_soft; } window.maint box.tile.crit image { color: @m_crit; }
+window.maint box.tile.info { background-color: @m_info_soft; } window.maint box.tile.info image { color: @m_info; }
+window.maint box.tile.off { background-color: @m_surface2; } window.maint box.tile.off image { color: @m_dim; }
+window.maint box.tile.done { background-color: @m_accent_soft; } window.maint box.tile.done image { color: @m_accent; }
+window.maint .cmd { MONO font-size: 88%; padding: 4px 10px; border-radius: 6px; background-color: @m_surface2; }
+window.maint .details { MONO font-size: 88%; padding: 8px 12px; border-radius: 8px; background-color: @m_surface2; }
+window.maint .status-mono { MONO font-size: 88%; color: @m_dim; }
+window.maint .th { color: @m_dim; font-weight: 500; padding: 4px 0; border-bottom: 1px solid @m_line; }
+window.maint .td { padding: 5px 0; border-bottom: 1px solid @m_line; }
+window.maint .td.ok { color: @m_ok; font-weight: 600; }
+window.maint .td.crit { color: @m_crit; font-weight: 600; }
+window.maint .td.strong { font-weight: 600; }
+window.maint .amount { font-size: 112%; font-weight: 600; }
+window.maint .toast { color: @m_crit; font-weight: 600; }
+window.maint .card { border: 1px solid @m_line; border-radius: 14px; background-color: @m_surface; padding: 18px 20px; }
+window.maint .about-name { font-size: 190%; font-weight: 600; }
+window.maint .about-version { color: @m_dim; }
+window.maint .ok-text { color: @m_ok; font-weight: 600; }
+window.maint .warn-text { color: @m_warn; font-weight: 600; }
+window.maint .info-text { color: @m_info; font-weight: 600; }
+window.maint .banner { padding: 9px 16px; }
+window.maint .banner.warn { background-color: @m_warn_soft; border-bottom: 1px solid @m_line; }
+window.maint .banner.info { background-color: @m_info_soft; border-radius: 10px; padding: 10px 14px; }
+
+/* Bandeau de la vue d'ensemble */
+window.maint box.band { background-color: @m_surface; border: 1px solid @m_line; border-radius: 14px; }
+window.maint button.seg { background: transparent; border: none; border-right: 1px solid @m_line; border-radius: 0;
+  padding: 0; }
+window.maint button.seg.first { border-radius: 14px 0 0 14px; }
+window.maint button.seg.last { border-right: none; border-radius: 0 14px 14px 0; }
+window.maint button.seg:hover { background: @m_hover; }
+window.maint .seg-label, window.maint .seg-sub { color: @m_dim; font-size: 92%; }
+window.maint .seg-value { font-size: 160%; font-weight: 600; }
+
+/* Journal */
+window.maint .journal-head { background-color: @m_term; color: @m_term_fg; padding: 3px 10px 3px 16px;
+  border-top: 1px solid @m_line; border-bottom: 1px solid @m_term_line; }
+window.maint .journal-head label, window.maint .journal-head image, window.maint .jbar label,
+window.maint .jbar image { color: @m_term_fg; }
+window.maint .journal-head button, window.maint .jbar button { background: transparent; border: 1px solid transparent;
+  color: @m_term_fg; padding: 3px 12px; }
+window.maint .journal-head button:hover, window.maint .jbar button:hover { background: alpha(#ffffff, 0.08); }
+window.maint .jbar button { border-color: @m_term_line; }
+window.maint textview.journal, window.maint textview.journal text { background-color: @m_term; color: @m_term_fg; MONO }
+window.maint .jbar { background-color: @m_term; padding: 4px 10px 4px 16px; border-top: 1px solid @m_line; }
+window.maint .jbar label.jl-h { color: #a5d98b; }
+window.maint .jbar label.jl-s { color: #f0c46a; }
+window.maint .jbar label.jl-e { color: #ff8a82; }
+window.maint .jbar label.jl-c { color: #8ec5ff; }
+window.maint .jbar label.jl-d { color: @m_term_dim; }
 """
+
+
+def build_css(pal, sans, mono):
+    head = ''.join(f'@define-color m_{k} {v};\n' for k, v in pal.items())
+    body = CSS.replace('FONTSANS', f'font-family: {sans};' if sans else '')
+    body = body.replace('MONO', f'font-family: {mono};')
+    return (head + body).encode('utf-8')
+
+
 
 
 class MainWindow(Gtk.ApplicationWindow):
     def __init__(self, app=None):
         super().__init__(application=app) if app else super().__init__()
         self.settings = load_settings()
-        self.sim = self.settings.get('simulation', True)
         self.runner = Runner(self)
         self.set_title('Maintenance')
         self.set_icon_name('applications-system')
@@ -3722,10 +4108,19 @@ class MainWindow(Gtk.ApplicationWindow):
         self._dirty = False
         self.start_free = disk_usage('/')[1]
 
-        prov = Gtk.CssProvider()
-        prov.load_from_data(CSS)
-        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov,
+        self.get_style_context().add_class('maint')
+        gs = Gtk.Settings.get_default()
+        ok_c, c = self.get_style_context().lookup_color('theme_bg_color')
+        self.sys_dark = (bool(gs.get_property('gtk-application-prefer-dark-theme'))
+                         or 'dark' in (gs.get_property('gtk-theme-name') or '').lower()
+                         or (bool(ok_c) and (0.2126 * c.red + 0.7152 * c.green + 0.0722 * c.blue) < 0.5))
+        fams = {f.get_name() for f in self.get_pango_context().list_families()}
+        self.font_sans = "'IBM Plex Sans', sans-serif" if 'IBM Plex Sans' in fams else ''
+        self.font_mono = "'IBM Plex Mono', monospace" if 'IBM Plex Mono' in fams else 'monospace'
+        self.css_prov = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), self.css_prov,
                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.apply_theme()
 
         # Barre de titre
         hb = Gtk.HeaderBar()
@@ -3738,6 +4133,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.hb = hb
         self.set_titlebar(hb)
         self.refresh_btn = Gtk.Button()
+        self.refresh_btn.get_style_context().add_class('icon-btn')
         self.refresh_btn.set_image(symbolic(['view-refresh-symbolic'], 16))
         self.refresh_btn.set_tooltip_text('Tout analyser à nouveau (F5)')
         self.refresh_btn.connect('clicked', lambda _b: self.refresh_all())
@@ -3745,20 +4141,25 @@ class MainWindow(Gtk.ApplicationWindow):
         self.spinner = Gtk.Spinner()
         hb.pack_start(self.spinner)
         self.jbtn = Gtk.ToggleButton()
+        self.jbtn.get_style_context().add_class('icon-btn')
         self.jbtn.set_image(symbolic(['utilities-terminal-symbolic'], 16))
         self.jbtn.set_tooltip_text('Journal d’activité')
         self.jbtn.connect('toggled', lambda b: self.show_journal(b.get_active()))
         hb.pack_end(self.jbtn)
-        simbox = hbox(8)
-        simbox.pack_start(label('Simulation'), False, False, 0)
-        self.sim_sw = Gtk.Switch()
-        self.sim_sw.set_valign(Gtk.Align.CENTER)
-        self.sim_sw.set_active(self.sim)
-        self.sim_sw.set_tooltip_text('En simulation, les actions qui modifient le système sont seulement affichées.')
-        self.sim_sw.connect('notify::active', self._sim_toggled)
-        simbox.pack_start(self.sim_sw, False, False, 0)
-        hb.pack_end(simbox)
+        self.theme_btn = Gtk.Button()
+        self.theme_btn.get_style_context().add_class('icon-btn')
+        self.theme_btn.connect('clicked', lambda _b: self.toggle_theme())
+        hb.pack_end(self.theme_btn)
+        self.update_theme_btn()
         self.lock_btn = Gtk.Button()
+        self.lock_btn.get_style_context().add_class('pill')
+        lb_box = hbox(8)
+        self.lock_img = symbolic(['changes-prevent-symbolic'], 16)
+        self.lock_lbl = label('Droits non accordés')
+        lb_box.pack_start(self.lock_img, False, False, 0)
+        lb_box.pack_start(self.lock_lbl, False, False, 0)
+        self.lock_btn.add(lb_box)
+        self.lock_btn.set_valign(Gtk.Align.CENTER)
         self.lock_btn.connect('clicked', lambda _b: self._lock_clicked())
         hb.pack_end(self.lock_btn)
         self.session = SudoSession(self)
@@ -3804,6 +4205,7 @@ class MainWindow(Gtk.ApplicationWindow):
         foot.get_style_context().add_class('sidebar-foot')
         self.disk_l = label('', css=('small',), markup=True)
         self.disk_pb = Gtk.ProgressBar()
+        self.disk_pb.get_style_context().add_class('ok')
         self.gain_l = label('', css=('small', 'dim-label'))
         self.gain_l.set_no_show_all(True)
         foot.pack_start(self.disk_l, False, False, 0)
@@ -3811,17 +4213,8 @@ class MainWindow(Gtk.ApplicationWindow):
         foot.pack_start(self.gain_l, False, False, 0)
         side.pack_start(foot, False, False, 0)
         body.pack_start(side, False, False, 0)
-        body.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 0)
 
         right = vbox(0)
-        self.sim_bar = Gtk.InfoBar()
-        self.sim_bar.set_message_type(Gtk.MessageType.WARNING)
-        self.sim_bar.get_content_area().add(label(
-            'Mode simulation : les actions qui modifient le système sont seulement affichées dans le journal. '
-            'Les analyses (SMART, journaux, vérifications) sont réelles.', wrap=True))
-        self.sim_bar.add_button('Désactiver', 1)
-        self.sim_bar.connect('response', lambda _b, _r: self.sim_sw.set_active(False))
-        right.pack_start(self.sim_bar, False, False, 0)
         self.paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
         self.stack = Gtk.Stack()
         self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
@@ -3840,6 +4233,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.paned.pack1(self.stack, True, False)
         self.paned.pack2(self.journal.widget, False, False)
         right.pack_start(self.paned, True, True, 0)
+        right.pack_start(self.journal.bar, False, False, 0)
         body.pack_start(right, True, True, 0)
         self.add(body)
 
@@ -3848,13 +4242,10 @@ class MainWindow(Gtk.ApplicationWindow):
         self.show_all()
         self.paned.set_position(max(320, h - 330))
         GLib.idle_add(self._fit_journal)
-        self._update_sim_ui()
         self.show_journal(self.settings.get('journal', True))
         rc, out, _ = run(['pacman', '-Q', PKG_NAME], timeout=5)
         pkg = f' ({out.split()[1]})' if rc == 0 and len(out.split()) > 1 else ''
         self.journal.add(f'Maintenance {VERSION}{pkg} prête.', 'd')
-        if self.sim:
-            self.journal.add('Mode simulation activé : les actions qui modifient le système sont seulement affichées ici.', 's')
         self.side_list.select_row(self.side_list.get_row_at_index(0))
         self.update_disk()
         self.update_lock()
@@ -3871,11 +4262,13 @@ class MainWindow(Gtk.ApplicationWindow):
     # --- navigation ---
     @staticmethod
     def _side_header(row, _before):
-        if row.sid == 'about' and row.get_header() is None:
-            sep = Gtk.Separator()
-            sep.set_margin_top(4)
-            sep.set_margin_bottom(4)
-            row.set_header(sep)
+        if row.get_header() is not None:
+            return
+        groups = {'clean': 'Entretien', 'health': 'Diagnostic', 'dups': 'Outils'}
+        if row.sid in groups:
+            row.set_header(label(groups[row.sid], css=('side-group',)))
+        elif row.sid == 'about':
+            row.set_header(Gtk.Separator())
 
     def _section_selected(self, _lb, row):
         if row is not None:
@@ -3983,8 +4376,7 @@ class MainWindow(Gtk.ApplicationWindow):
             return
         tot = sum(it.state.get('amount') or 0 for it in chosen)
         lines = [f'{it.title}' + (f' · {fmt_size(it.state["amount"])}' if it.state.get('amount') else '') for it in chosen]
-        txt = (f'Environ {fmt_size(tot)} au moins.' if tot else '') + \
-            (' Mode simulation : rien ne sera supprimé.' if self.sim else '')
+        txt = f'Environ {fmt_size(tot)} au moins.' if tot else ''
         if any(it.id == 'tr' for it in chosen):
             txt += ' La corbeille sera vidée définitivement.'
         if not confirm(self, f'Nettoyer {plural(len(chosen), "élément")} ?', txt.strip(), ok_label='Nettoyer', items=lines):
@@ -3999,13 +4391,13 @@ class MainWindow(Gtk.ApplicationWindow):
             if it.row:
                 it.row.update()
 
-        def done(ok, sim):
+        def done(ok):
             for it in chosen:
                 it.busy = False
-                it.done_msg = ('warn', 'Simulé') if sim else (('done', 'Fait') if ok else ('crit', 'À vérifier'))
+                it.done_msg = ('off', 'Arrêté') if self.runner.stopped else \
+                    (('done', 'Fait') if ok else ('crit', 'À vérifier'))
                 it.refresh()
-            if not sim:
-                self.journal.add(f'Gagné depuis l’ouverture : {fmt_size(self.gained())}.', 'h')
+            self.journal.add(f'Gagné depuis l’ouverture : {fmt_size(self.gained())}.', 'h')
             self.after_action()
 
         self.runner.start('Nettoyage de la sélection', steps, done)
@@ -4030,17 +4422,53 @@ class MainWindow(Gtk.ApplicationWindow):
     def update_lock(self):
         s = self.session
         if s.ok:
-            names, tip = ['changes-allow-symbolic'], ('Droits administrateur accordés pour la session. '
-                                                     'Clique pour les retirer.')
+            names, text, kind = ['security-high-symbolic', 'changes-allow-symbolic'], 'Administrateur', 'ok'
+            tip = 'Droits administrateur accordés jusqu’à la fermeture. Clique pour les retirer.'
         elif s.pending:
-            names, tip = ['changes-prevent-symbolic'], 'Authentification en cours…'
+            names, text, kind = ['changes-prevent-symbolic'], 'Authentification…', 'off'
+            tip = 'Saisis ton mot de passe dans la fenêtre qui vient de s’ouvrir.'
         else:
-            names, tip = ['changes-prevent-symbolic'], ('Droits administrateur non accordés. Clique pour saisir le '
-                                                       'mot de passe une fois pour toute la session.')
-        self.lock_btn.set_image(symbolic(names + ['dialog-password-symbolic'], 16))
+            names, text, kind = ['changes-prevent-symbolic'], 'Droits non accordés', 'off'
+            tip = ('Clique pour saisir ton mot de passe : il restera valable jusqu’à la fermeture de l’application. '
+                   'Il est aussi demandé quand tu lances une action administrateur.')
+        self.lock_img.set_from_gicon(themed(names + ['dialog-password-symbolic']), Gtk.IconSize.MENU)
+        self.lock_img.set_pixel_size(16)
+        self.lock_lbl.set_text(text)
+        ctx = self.lock_btn.get_style_context()
+        for k in ('ok', 'off'):
+            ctx.remove_class(k)
+        ctx.add_class(kind)
         self.lock_btn.set_tooltip_text(tip)
         self.lock_btn.set_sensitive(not s.pending and not self.runner.busy)
+        if getattr(self, '_lock_shown', None) != s.ok and hasattr(self, 'items'):
+            self._lock_shown = s.ok
+            for it in self.items.values():
+                if it.row:
+                    it.row.update()      # cadenas sur les boutons administrateur
         return False
+
+    # --- thème ---
+    def is_dark(self):
+        mode = self.settings.get('theme', 'auto')
+        return self.sys_dark if mode == 'auto' else mode == 'sombre'
+
+    def apply_theme(self):
+        dark = self.is_dark()
+        self.css_prov.load_from_data(build_css(PALETTES['sombre' if dark else 'clair'], self.font_sans, self.font_mono))
+        if self.settings.get('theme', 'auto') != 'auto':
+            Gtk.Settings.get_default().set_property('gtk-application-prefer-dark-theme', dark)
+
+    def toggle_theme(self):
+        self.settings['theme'] = 'clair' if self.is_dark() else 'sombre'
+        save_settings(self.settings)
+        self.apply_theme()
+        self.update_theme_btn()
+
+    def update_theme_btn(self):
+        dark = self.is_dark()
+        self.theme_btn.set_image(symbolic(['weather-clear-symbolic', 'display-brightness-symbolic'] if dark else
+                                          ['weather-clear-night-symbolic', 'night-light-symbolic'], 16))
+        self.theme_btn.set_tooltip_text('Passer en thème clair' if dark else 'Passer en thème sombre')
 
     def _lock_clicked(self):
         if self.session.ok:
@@ -4078,12 +4506,23 @@ class MainWindow(Gtk.ApplicationWindow):
                     it.row.update()
         return False
 
+    def _tick(self):
+        if not self.runner.busy:
+            self._tick_id = 0
+            return False
+        status = self.runner.last_line or self.runner.cur_label or 'En cours…'
+        for it in self.items.values():
+            if it.busy and it.row:
+                it.row.tick(status)
+        return True
+
     def set_busy(self, busy):
+        if busy and not getattr(self, '_tick_id', 0):
+            self._tick_id = GLib.timeout_add(120, self._tick)
         self.update_stop()
         self.spinner.start() if busy else self.spinner.stop()
         self.hb.props.subtitle = self.base_sub + (' · opération en cours…' if busy else '')
         self.refresh_btn.set_sensitive(not busy)
-        self.sim_sw.set_sensitive(not busy)
         self.update_lock()
         for it in self.items.values():
             if it.row:
@@ -4095,24 +4534,12 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def show_journal(self, show):
         self.journal.widget.set_visible(show)
+        self.journal.bar.set_visible(not show)
         if self.jbtn.get_active() != show:
             self.jbtn.set_active(show)
         if self.settings.get('journal') != show:
             self.settings['journal'] = show
             save_settings(self.settings)
-
-    def _sim_toggled(self, sw, _p):
-        self.sim = sw.get_active()
-        self.settings['simulation'] = self.sim
-        save_settings(self.settings)
-        self._update_sim_ui()
-        self.journal.add('Mode simulation activé : les modifications sont seulement affichées.' if self.sim else
-                         'Mode simulation désactivé : les actions modifient vraiment le système.', 's' if self.sim else 'h')
-
-    def _update_sim_ui(self):
-        if hasattr(self.sim_bar, 'set_revealed'):
-            self.sim_bar.set_revealed(self.sim)
-        self.sim_bar.set_visible(self.sim)
 
     def _on_key(self, _w, ev):
         if ev.keyval == Gdk.KEY_F5 and not self.runner.busy:

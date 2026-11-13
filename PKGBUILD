@@ -16,7 +16,8 @@ optdepends=('yay: mises à jour et cache de l’AUR'
             'reflector: classement des miroirs'
             'fwupd: mises à jour du firmware'
             'flatpak: applications Flatpak'
-            'meld: fusion des fichiers .pacnew')
+            'meld: fusion des fichiers .pacnew'
+            'ttf-ibm-plex: police de l’interface')
 provides=('maintenance')
 conflicts=('maintenance')
 source=("$pkgname::git+$url.git")
