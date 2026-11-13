@@ -3,9 +3,9 @@
 """
 Maintenance — nettoyage, mises à jour et santé d'Arch Linux, pensé pour Cinnamon (GTK3).
 
-Tout se fait dans une seule fenêtre. Les actions qui demandent les droits
-administrateur passent par sudo avec une fenêtre de mot de passe : sudo garde
-ensuite l'autorisation quelques minutes (5 par défaut sur Arch).
+Tout se fait dans une seule fenêtre. Le mot de passe administrateur est demandé
+une seule fois à l'ouverture : un petit assistant lancé par sudo exécute ensuite
+les commandes administrateur jusqu'à la fermeture de l'application.
 
 Usage :
     maintenance              ouvre la fenêtre
@@ -22,21 +22,126 @@ import time
 import shlex
 import struct
 import shutil
+import signal
 import socket
 import hashlib
 import platform
 import threading
+import queue
 import subprocess
 import urllib.request
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
-import gi
+# ============================================================================
+#  Assistant administrateur : lancé une seule fois par sudo à l'ouverture
+# ============================================================================
+def write_frame(f, kind, jid, data=b''):
+    f.write(kind + struct.pack('!II', jid, len(data)) + data)
+    f.flush()
+
+
+def read_frame(f):
+    head = f.read(9)
+    if len(head) < 9:
+        raise EOFError
+    kind = head[:1]
+    jid, n = struct.unpack('!II', head[1:])
+    data = f.read(n) if n else b''
+    if len(data) < n:
+        raise EOFError
+    return kind, jid, data
+
+
+def root_helper_main():
+    """Exécute en administrateur les commandes que l'application lui envoie sur son entrée.
+
+    Seule l'application qui l'a lancé tient ses tubes : aucun autre programme ne peut lui parler.
+    Quand l'application se ferme, l'entrée se ferme et l'assistant s'arrête après les commandes en cours.
+    """
+    out = sys.stdout.buffer
+    lock = threading.Lock()
+    procs = {}
+
+    def send(kind, jid, data=b''):
+        with lock:
+            try:
+                write_frame(out, kind, jid, data)
+            except OSError:
+                pass
+
+    def job(jid, req):
+        env = dict(os.environ)
+        env.update({str(k): str(v) for k, v in (req.get('env') or {}).items()})
+        cwd = req.get('cwd')
+        cwd = cwd if cwd and os.path.isdir(cwd) else '/'
+        detach = bool(req.get('detach'))
+        try:
+            p = subprocess.Popen([str(a) for a in req['argv']], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL if detach else subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL if detach else subprocess.STDOUT,
+                                 cwd=cwd, env=env, start_new_session=True)
+        except (OSError, KeyError, TypeError) as e:
+            send(b'O', jid, f'{e}\n'.encode())
+            send(b'X', jid, struct.pack('!i', 127))
+            return
+        if detach:
+            send(b'X', jid, struct.pack('!i', 0))
+            p.wait()
+            return
+        procs[jid] = p
+        for chunk in iter(lambda: p.stdout.read1(65536), b''):
+            send(b'O', jid, chunk)
+        rc = p.wait()
+        procs.pop(jid, None)
+        send(b'X', jid, struct.pack('!i', rc))
+
+    def kill(jid):
+        p = procs.get(jid)
+        if p is None:
+            return
+        for sig, wait in ((signal.SIGTERM, 4), (signal.SIGKILL, 0)):
+            try:
+                os.killpg(p.pid, sig)
+            except OSError:
+                return
+            try:
+                p.wait(timeout=wait or None)
+                return
+            except subprocess.TimeoutExpired:
+                continue
+
+    send(b'R', 0)
+    threads = []
+    for line in sys.stdin.buffer:
+        try:
+            req = json.loads(line)
+            jid = int(req.get('id', 0))
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if req.get('op') == 'ping':
+            send(b'X', jid, struct.pack('!i', 0))
+            continue
+        if req.get('op') == 'kill':
+            threading.Thread(target=kill, args=(jid,), daemon=True).start()
+            continue
+        t = threading.Thread(target=job, args=(jid, req))
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+    return 0
+
+
+if __name__ == '__main__' and sys.argv[1:2] == ['--root-helper']:
+    sys.exit(root_helper_main())
+
+import gi  # noqa: E402
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, Gio, GLib, Pango  # noqa: E402
 
 APP_ID = 'io.github.theworms.Maintenance'
-VERSION = '1.3'
+VERSION = '1.4'
 REPO_URL = 'https://github.com/TheWorms/maintenance'
 REPO_API = 'https://api.github.com/repos/TheWorms/maintenance'
 PKG_NAME = 'maintenance-git'
@@ -54,7 +159,6 @@ TRASH_DIR = os.path.join(HOME, '.local', 'share', 'Trash')
 BUILD_DIR = os.path.join(XDG_CACHE, 'maintenance', 'paquet')
 SESSION_DIR = os.path.join(RUNTIME, f'maintenance-{os.getuid()}')
 RELAY_SOCK = os.path.join(SESSION_DIR, 'sudo.sock')
-KEEPALIVE_SECONDS = 60   # rafraîchit l'autorisation sudo tant que l'application est ouverte
 JOURNAL_DAYS = 7
 CACHE_AGE_DAYS = 30
 MIRROR_COUNTRIES = 'France,Germany,Belgium,Switzerland'
@@ -142,8 +246,8 @@ def ago(ts):
     return f'il y a {d // 30} mois'
 
 
-def dir_size(path, skip=()):
-    """Taille et nombre de fichiers d'un dossier (sans suivre les liens)."""
+def dir_size(path, skip=(), stop=None):
+    """Taille et nombre de fichiers d'un dossier (sans suivre les liens). stop() vrai = on abandonne."""
     total = count = 0
     try:
         st = os.lstat(path)
@@ -152,6 +256,8 @@ def dir_size(path, skip=()):
     if not stat.S_ISDIR(st.st_mode):
         return st.st_size, 1
     for root, dirs, files in os.walk(path, onerror=lambda e: None):
+        if stop is not None and stop():
+            break
         if skip:
             dirs[:] = [d for d in dirs if os.path.join(root, d) not in skip]
         for f in files:
@@ -227,6 +333,10 @@ def disk_usage(path='/'):
         return 0, 0
 
 
+def version_key(v):
+    return tuple(int(x) for x in re.findall(r'\d+', v))
+
+
 def distro_name():
     try:
         with open('/etc/os-release', encoding='utf-8') as f:
@@ -296,33 +406,8 @@ def relay_wrapper():
     return helper_script('sudo', '--sudo-relay')
 
 
-def sudo_quiet(args, ctx=''):
-    """sudo sans terminal (le ticket est lié au processus de l'application), sortie ignorée."""
-    env = dict(os.environ, MAINTENANCE_ASKPASS_CTX=ctx)
-    try:
-        env['SUDO_ASKPASS'] = askpass_wrapper()
-    except OSError:
-        pass
-    try:
-        return subprocess.run(['sudo'] + list(args), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL, env=env, start_new_session=True, timeout=600).returncode
-    except (OSError, subprocess.TimeoutExpired):
-        return 1
-
-
-# ---- relais sudo : protocole en trames (type 1 octet, longueur 4 octets, données)
-def send_frame(conn, kind, data=b''):
-    conn.sendall(kind + struct.pack('!I', len(data)) + data)
-
-
-def recv_exact(conn, n):
-    buf = b''
-    while len(buf) < n:
-        chunk = conn.recv(n - len(buf))
-        if not chunk:
-            raise EOFError
-        buf += chunk
-    return buf
+def sock_send(conn, kind, data=b''):
+    conn.sendall(kind + struct.pack('!II', 0, len(data)) + data)
 
 
 def is_descendant(pid, ancestor):
@@ -348,14 +433,16 @@ def relay_client(args):
         os.execvp('sudo', ['sudo'] + list(args))   # application fermée : sudo classique
     s.sendall(json.dumps({'argv': list(args), 'cwd': os.getcwd()}).encode() + b'\n')
     out = sys.stdout.buffer
+    rf = s.makefile('rb')
     try:
         while True:
-            kind = recv_exact(s, 1)
-            n = struct.unpack('!I', recv_exact(s, 4))[0]
-            data = recv_exact(s, n) if n else b''
+            kind, _jid, data = read_frame(rf)
             if kind == b'O':
                 out.write(data)
                 out.flush()
+            elif kind == b'N':
+                sys.stderr.write(data.decode('utf-8', 'replace') + '\n')
+                return 126
             elif kind == b'X':
                 return struct.unpack('!i', data)[0]
     except (EOFError, OSError):
@@ -388,44 +475,38 @@ def askpass_main(args):
     except OSError:
         pass
 
-    dlg = Gtk.Dialog(title='Authentification requise')
-    dlg.set_icon_name('dialog-password')
+    # 1) L'application est ouverte : la fenêtre s'affiche dedans et reçoit directement le clavier.
+    try:
+        sk = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sk.connect(RELAY_SOCK)
+        sk.sendall(json.dumps({'askpass': prompt, 'ctx': ctx, 'tries': tries}).encode() + b'\n')
+        kind, _jid, data = read_frame(sk.makefile('rb'))
+        if kind == b'P':
+            sys.stdout.write(data.decode('utf-8') + '\n')
+            sys.stdout.flush()
+            return 0
+        if kind == b'X':
+            return 1
+    except (OSError, EOFError, ValueError):
+        pass
+    # 2) Sinon, fenêtre autonome, mise au premier plan avec l'heure du serveur X
+    #    (sans quoi le gestionnaire de fenêtres peut lui refuser le clavier).
+    dlg, entry = password_dialog(prompt, ctx, tries)
     dlg.set_keep_above(True)
     dlg.set_position(Gtk.WindowPosition.CENTER)
-    dlg.set_default_size(440, -1)
-    dlg.add_button('Annuler', Gtk.ResponseType.CANCEL)
-    ok = dlg.add_button('Authentifier', Gtk.ResponseType.OK)
-    ok.get_style_context().add_class('suggested-action')
-    dlg.set_default_response(Gtk.ResponseType.OK)
-
-    box = Gtk.Box(spacing=16)
-    box.set_border_width(16)
-    img = Gtk.Image.new_from_icon_name('dialog-password', Gtk.IconSize.DIALOG)
-    img.set_valign(Gtk.Align.START)
-    box.pack_start(img, False, False, 0)
-    col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-    t = Gtk.Label(xalign=0)
-    t.set_markup('<b><big>Authentification requise</big></b>')
-    col.pack_start(t, False, False, 0)
-    lab = Gtk.Label(label='« Maintenance » a besoin des droits administrateur.', xalign=0, wrap=True,
-                    max_width_chars=50)
-    col.pack_start(lab, False, False, 0)
-    if ctx:
-        act = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
-        act.set_markup(f'Action : <b>{GLib.markup_escape_text(ctx)}</b>')
-        col.pack_start(act, False, False, 0)
-    if tries >= 1:
-        bad = Gtk.Label(xalign=0)
-        bad.set_markup('<span foreground="#d4453f"><b>Mot de passe incorrect, réessaie.</b></span>')
-        col.pack_start(bad, False, False, 0)
-    pl = Gtk.Label(label=prompt.strip() or 'Mot de passe :', xalign=0)
-    col.pack_start(pl, False, False, 0)
-    entry = Gtk.Entry(visibility=False, activates_default=True)
-    entry.set_input_purpose(Gtk.InputPurpose.PASSWORD)
-    col.pack_start(entry, False, False, 0)
-    box.pack_start(col, True, True, 0)
-    dlg.get_content_area().add(box)
     dlg.show_all()
+    try:
+        gi.require_version('GdkX11', '3.0')
+        from gi.repository import GdkX11
+        w = dlg.get_window()
+        if isinstance(w, GdkX11.X11Window):
+            ts = GdkX11.x11_get_server_time(w)
+            w.set_user_time(ts)
+            dlg.present_with_time(ts)
+        else:
+            dlg.present()
+    except (ValueError, ImportError):
+        dlg.present()
     entry.grab_focus()
     resp = dlg.run()
     pw = entry.get_text()
@@ -437,6 +518,42 @@ def askpass_main(args):
     return 1
 
 
+def password_dialog(prompt, ctx, tries, parent=None):
+    dlg = Gtk.Dialog(title='Authentification requise', transient_for=parent, modal=parent is not None)
+    dlg.set_icon_name('dialog-password')
+    dlg.set_default_size(440, -1)
+    dlg.add_button('Annuler', Gtk.ResponseType.CANCEL)
+    ok = dlg.add_button('Authentifier', Gtk.ResponseType.OK)
+    ok.get_style_context().add_class('suggested-action')
+    dlg.set_default_response(Gtk.ResponseType.OK)
+    box = Gtk.Box(spacing=16)
+    box.set_border_width(16)
+    img = Gtk.Image.new_from_icon_name('dialog-password', Gtk.IconSize.DIALOG)
+    img.set_valign(Gtk.Align.START)
+    box.pack_start(img, False, False, 0)
+    col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    t = Gtk.Label(xalign=0)
+    t.set_markup('<b><big>Authentification requise</big></b>')
+    col.pack_start(t, False, False, 0)
+    col.pack_start(Gtk.Label(label='« Maintenance » a besoin des droits administrateur.', xalign=0, wrap=True,
+                             max_width_chars=50), False, False, 0)
+    if ctx:
+        act = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
+        act.set_markup(f'Action : <b>{GLib.markup_escape_text(ctx)}</b>')
+        col.pack_start(act, False, False, 0)
+    if tries >= 1:
+        bad = Gtk.Label(xalign=0)
+        bad.set_markup('<span foreground="#d4453f"><b>Mot de passe incorrect, réessaie.</b></span>')
+        col.pack_start(bad, False, False, 0)
+    col.pack_start(Gtk.Label(label=prompt.strip() or 'Mot de passe :', xalign=0), False, False, 0)
+    entry = Gtk.Entry(visibility=False, activates_default=True)
+    entry.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+    col.pack_start(entry, False, False, 0)
+    box.pack_start(col, True, True, 0)
+    dlg.get_content_area().add(box)
+    return dlg, entry
+
+
 # ============================================================================
 #  Exécution des commandes
 # ============================================================================
@@ -445,7 +562,8 @@ class Step:
 
     def __init__(self, argv=None, func=None, root=False, modifies=True, label=None,
                  pacman=False, yay=False, askpass=False, c_locale=False, quiet=False,
-                 capture=None, fallback=None, fallback_if=None, env=None, ok_codes=(0,), stop=False):
+                 capture=None, fallback=None, fallback_if=None, env=None, ok_codes=(0,), stop=False,
+                 critical=None):
         self.argv = argv
         self.func = func
         self.root = root
@@ -462,6 +580,8 @@ class Step:
         self.env = env or {}
         self.ok_codes = ok_codes
         self.stop = stop
+        # Étape à ne jamais couper au milieu (pacman, yay, firmware, instantané) : l'arrêt attend sa fin.
+        self.critical = critical if critical is not None else bool((pacman or yay) and modifies)
 
     def display(self):
         if self.label:
@@ -480,6 +600,47 @@ class Runner:
     def __init__(self, win):
         self.win = win
         self.busy = False
+        self.cancel_req = False
+        self.stopped = False     # la dernière opération a été arrêtée par le bouton
+        self.cur = None          # ('user', Popen) ou ('root', numéro) : commande en cours
+        self.cur_step = None
+
+    def cancel(self):
+        """Bouton « Arrêter » : coupe la commande en cours, sauf pacman/yay/firmware/instantané
+        (on attend alors la fin de l'étape) ; les étapes suivantes ne sont pas lancées."""
+        if not self.busy or self.cancel_req:
+            return
+        self.cancel_req = True
+        st = self.cur_step
+        if st is not None and st.critical:
+            self.win.journal.add('■ Arrêt demandé : l’étape en cours ne peut pas être coupée sans risque '
+                                 f'({st.display()[:60]}). L’opération s’arrêtera dès qu’elle sera finie.', 's')
+        else:
+            self.win.journal.add('■ Arrêt demandé…', 's')
+            self._kill_current()
+        self.win.update_stop()
+
+    def _kill_current(self):
+        cur = self.cur
+        if cur is None:
+            return
+        kind, ref = cur
+        if kind == 'root':
+            self.win.session.kill(ref)
+            return
+
+        def term(p=ref):
+            for sig, wait in ((signal.SIGTERM, 4), (signal.SIGKILL, 0)):
+                try:
+                    os.killpg(p.pid, sig)
+                except OSError:
+                    return
+                try:
+                    p.wait(timeout=wait or None)
+                    return
+                except subprocess.TimeoutExpired:
+                    continue
+        threading.Thread(target=term, daemon=True).start()
 
     def start(self, title, steps, done=None):
         if self.busy:
@@ -487,6 +648,8 @@ class Runner:
         sim = self.win.sim
         self.t0 = time.monotonic()
         self.title = title
+        self.cancel_req = False
+        self.cur = self.cur_step = None
         self.busy = True
         self.win.set_busy(True)
         self.win.journal.add('')
@@ -501,16 +664,14 @@ class Runner:
     def _work(self, title, steps, sim, done):
         ok_all = True
         needs_root = any(s.root and (not s.modifies or not sim) for s in steps)
-        if needs_root and os.geteuid() != 0:
-            reset_askpass_counter()
-            rc, _ = self._exec(['sudo', '-A', '-v'], title, askpass=True, quiet=True)
-            if rc == 0:
-                GLib.idle_add(self.win.session._logged, True)
-            if rc != 0:
-                self._log('Authentification annulée ou refusée : rien n’a été lancé.', 'e')
-                GLib.idle_add(self._finish, done, False, sim)
-                return
+        if needs_root and os.geteuid() != 0 and not self.win.session.ensure():
+            self._log('Authentification annulée ou refusée : rien n’a été lancé.', 'e')
+            GLib.idle_add(self._finish, done, False, sim)
+            return
         for st in steps:
+            if self.cancel_req:
+                break
+            self.cur_step = st
             if st.modifies and sim:
                 self._log(f'[simulation] {st.prompt()} {st.display()}', 's')
                 continue
@@ -534,6 +695,8 @@ class Runner:
                     if st.stop:
                         self._log('Arrêt : les étapes suivantes ne sont pas lancées.', 'e')
                         break
+                if self.cancel_req:
+                    break
                 if st.capture:
                     GLib.idle_add(st.capture, res, 0)
                 continue
@@ -543,6 +706,8 @@ class Runner:
                 reset_askpass_counter()
             rc, out = self._exec(st.argv, title, root=st.root, askpass=st.askpass,
                                  quiet=st.quiet, c_locale=st.c_locale, env=st.env)
+            if self.cancel_req and not st.critical:
+                break                       # commande coupée par « Arrêter » : pas de résultat partiel
             if rc not in st.ok_codes and st.fallback is not None and \
                     (not st.fallback_if or any(k in out for k in st.fallback_if)):
                 fb = st.fallback
@@ -564,8 +729,27 @@ class Runner:
     def _exec(self, argv, title, root=False, askpass=False, quiet=False, c_locale=False, env=None):
         if isinstance(argv, str):
             argv = ['sh', '-c', argv]
+        lines = []
         if root and os.geteuid() != 0:
-            argv = ['sudo', '-A', '--'] + list(argv)
+            extra = dict(env or {})
+            if c_locale:
+                extra['LC_ALL'] = 'C'
+            buf = [b'']
+
+            def on_out(data):
+                buf[0] += data
+                *complete, buf[0] = buf[0].split(b'\n')
+                for raw in complete:
+                    self._line(raw, lines, quiet)
+            rc = self.win.session.run(argv, env=extra, on_output=on_out,
+                                      on_start=lambda jid: setattr(self, 'cur', ('root', jid)))
+            self.cur = None
+            if buf[0]:
+                self._line(buf[0], lines, quiet)
+            if rc is None:
+                self._log('Droits administrateur non accordés : commande non lancée.', 'e')
+                return 1, ''
+            return rc, '\n'.join(lines)
         e = dict(os.environ)
         e.update(env or {})
         if askpass:
@@ -583,23 +767,33 @@ class Runner:
         except FileNotFoundError:
             self._log(f'Commande introuvable : {argv[0]}', 'e')
             return 127, ''
-        lines = []
+        self.cur = ('user', p)
+        if self.cancel_req and not (self.cur_step and self.cur_step.critical):
+            self._kill_current()
         for raw in iter(p.stdout.readline, b''):
-            line = raw.decode('utf-8', 'replace').rstrip('\n')
-            if '\r' in line:
-                parts = [x for x in line.split('\r') if x.strip()]
-                line = parts[-1] if parts else ''
-            line = ANSI.sub('', line)
-            lines.append(line)
-            if not quiet and line.strip():
-                self._log('  ' + line)
+            self._line(raw, lines, quiet)
         rc = p.wait()
+        self.cur = None
         return rc, '\n'.join(lines)
+
+    def _line(self, raw, lines, quiet):
+        line = raw.decode('utf-8', 'replace').rstrip('\n')
+        if '\r' in line:
+            parts = [x for x in line.split('\r') if x.strip()]
+            line = parts[-1] if parts else ''
+        line = ANSI.sub('', line)
+        lines.append(line)
+        if not quiet and line.strip():
+            self._log('  ' + line)
 
     def _finish(self, done, ok, sim):
         took = time.monotonic() - self.t0
         j = self.win.journal
-        if sim:
+        stopped = self.stopped = self.cancel_req
+        if stopped:
+            ok = False
+            j.add(f'■ Arrêté au bout de {duration(took)} : les étapes suivantes n’ont pas été lancées.', 's')
+        elif sim:
             j.add('— Simulation terminée : rien n’a été modifié.', 's')
         elif ok:
             j.add(f'✓ Terminé en {duration(took)}.', 'h')
@@ -608,9 +802,12 @@ class Runner:
         app = self.win.get_application()
         if app and took > 5 and not self.win.is_active():
             n = Gio.Notification.new('Maintenance')
-            n.set_body(f'{self.title} : ' + ('simulation terminée' if sim else 'terminé' if ok else 'terminé avec des erreurs'))
+            n.set_body(f'{self.title} : ' + ('arrêté' if stopped else 'simulation terminée' if sim else 'terminé' if ok
+                                              else 'terminé avec des erreurs'))
             app.send_notification('operation', n)
         self.busy = False
+        self.cancel_req = False
+        self.cur = self.cur_step = None
         self.win.set_busy(False)
         if done:
             done(ok, sim)
@@ -931,7 +1128,9 @@ class Item:
 
         def done(ok, sim):
             self.busy = False
-            if not ok:
+            if win.runner.stopped:
+                self.done_msg = ('off', 'Arrêté')
+            elif not ok:
                 self.done_msg = ('crit', 'Échec')
             elif sim and modifies:
                 self.done_msg = ('warn', 'Simulé')
@@ -1185,7 +1384,10 @@ class FlatpakUnused(Item):
         return {'chip': None, 'value': plural(n, 'runtime installé', 'runtimes installés'), 'todo': n > 0}
 
     def actions(self):
-        return [Action('Nettoyer', [Step(['flatpak', 'uninstall', '--unused', '--noninteractive'])], needs_todo=True)]
+        return [Action('Nettoyer', [Step(['flatpak', 'uninstall', '--unused', '--system', '--noninteractive'],
+                                         root=True),
+                                    Step(['flatpak', 'uninstall', '--unused', '--user', '--noninteractive'])],
+                       needs_todo=True)]
 
 
 class DockerItem(Item):
@@ -1277,7 +1479,9 @@ class FlatpakUpdates(Item):
                 'value': plural(len(lines), 'mise à jour', 'mises à jour'), 'details': lines[:12]}
 
     def actions(self):
-        return [Action('Mettre à jour', [Step(['flatpak', 'update', '--noninteractive'])], style='suggested-action'),
+        return [Action('Mettre à jour', [Step(['flatpak', 'update', '--system', '--noninteractive'], root=True),
+                                         Step(['flatpak', 'update', '--user', '--noninteractive'])],
+                       style='suggested-action'),
                 Action('Vérifier à nouveau', refresh_only=True)]
 
 
@@ -1304,7 +1508,7 @@ class Firmware(Item):
         acts = [Action('Rechercher', [Step(['fwupdmgr', 'get-updates'], modifies=False, capture=self._parse,
                                            ok_codes=(0, 2))])]
         if self.state.get('fw_updates'):
-            acts.insert(0, Action('Installer', [Step(['fwupdmgr', 'update', '-y']),
+            acts.insert(0, Action('Installer', [Step(['fwupdmgr', 'update', '-y'], root=True, critical=True),
                                                 Step(['fwupdmgr', 'get-updates'], modifies=False, quiet=True,
                                                      capture=self._parse, ok_codes=(0, 2))],
                                   style='suggested-action',
@@ -1356,8 +1560,8 @@ class Keyring(Item):
 
 
 class SelfUpdate(Item):
-    id, section = 'self', 'updates'
-    title = 'Maintenance (cette application)'
+    id, section = 'self', 'about'
+    title = 'Mise à jour de Maintenance'
     icons = ['applications-system', 'system-software-update']
     desc = (f'Met à jour l’application depuis son dépôt GitHub ({REPO_URL.split("github.com/")[-1]}) : '
             'le paquet est reconstruit avec makepkg puis installé.')
@@ -1378,14 +1582,39 @@ class SelfUpdate(Item):
             return {'chip': ('warn', 'Dépôt injoignable'), 'value': f'Version {ver}', 'ver': ver,
                     'hint': 'Vérifie la connexion, ou que le dépôt est public.'}
         remote = out.split()[0]
+        checked = time.strftime('vérifié à %H:%M')
         if local and remote.startswith(local):
-            return {'chip': ('ok', 'À jour'), 'value': f'Version {ver}', 'ver': ver, 'count': 0}
+            return {'chip': ('ok', 'À jour'), 'value': f'Version {VERSION} ({ver}) · {checked}', 'ver': ver,
+                    'count': 0}
+        rver = self._remote_version(remote)
+        if rver and version_key(rver) < version_key(VERSION):
+            return {'chip': ('warn', 'GitHub en retard'), 'count': 0, 'ver': ver, 'remote_ver': rver, 'older': True,
+                    'value': f'Installée : {VERSION} ({ver}) · sur GitHub : {rver} ({remote[:7]}) · {checked}',
+                    'hint': 'La version publiée sur GitHub est plus ancienne que la tienne : as-tu bien poussé '
+                            'tes changements (git push) ?'}
         det = self._changes(local, remote)
         n = len([d for d in det if not d.startswith('…')])
-        return {'chip': ('info', 'Nouvelle version'), 'count': 1, 'new': True, 'ver': ver,
-                'value': f'Installée : {ver} · sur GitHub : {remote[:7]}'
+        newer = f'{rver} ({remote[:7]})' if rver else remote[:7]
+        return {'chip': ('info', f'Version {rver} disponible' if rver else 'Nouvelle version'), 'count': 1,
+                'new': True, 'ver': ver, 'remote_ver': rver,
+                'value': f'Installée : {VERSION} ({ver}) · sur GitHub : {newer}'
                          + (f' · {plural(n, "nouveauté")}' if n else ''),
                 'details': det}
+
+    @staticmethod
+    def _remote_version(sha):
+        """Numéro de version (VERSION = '…') de la version publiée sur GitHub, si on peut le lire."""
+        if not REPO_URL.startswith('https://github.com/'):
+            return ''
+        url = f'https://raw.githubusercontent.com/{REPO_URL.split("github.com/", 1)[1]}/{sha}/maintenance.py'
+        try:
+            req = urllib.request.Request(url, headers={'Range': 'bytes=0-32767', 'User-Agent': 'maintenance'})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                head = r.read(32768).decode('utf-8', 'replace')
+        except Exception:  # noqa: BLE001
+            return ''
+        m = re.search(r"^VERSION = '([^']+)'", head, re.M)
+        return m.group(1) if m else ''
 
     @staticmethod
     def _changes(local, remote):
@@ -1643,11 +1872,14 @@ class DiskSpace(Item):
             entries = os.listdir(HOME)
         except OSError:
             entries = []
+        stop = lambda: self.win.runner.cancel_req  # noqa: E731
         for e in entries:
+            if stop():
+                return []
             p = os.path.join(HOME, e)
             if os.path.islink(p):
                 continue
-            res.append((dir_size(p)[0], e))
+            res.append((dir_size(p, stop=stop)[0], e))
         res.sort(reverse=True)
         return res[:10]
 
@@ -1697,13 +1929,14 @@ class TimeshiftItem(Item):
 
     def actions(self):
         return [Action('Créer un instantané',
-                       [Step(['timeshift', '--create', '--comments', 'Maintenance', '--tags', 'O', '--scripted'], root=True),
+                       [Step(['timeshift', '--create', '--comments', 'Maintenance', '--tags', 'O', '--scripted'], root=True,
+                             critical=True),
                         Step(['timeshift', '--list', '--scripted'], root=True, modifies=False, quiet=True,
                              c_locale=True, capture=self._parse)],
                        style='suggested-action'),
                 Action('Lister', [Step(['timeshift', '--list', '--scripted'], root=True, modifies=False,
                                        c_locale=True, capture=self._parse)]),
-                Action('Ouvrir Timeshift', handler=lambda: launch_cmd(['timeshift-launcher'], self.win.journal.add))]
+                Action('Ouvrir Timeshift', handler=lambda: self.win.session.launch(['timeshift-gtk'], 'Timeshift'))]
 
 
 class PkgList(Item):
@@ -1774,7 +2007,8 @@ class Pacnew(Item):
         if not have('meld'):
             intro += 'Installe Meld (section Logiciels de maintenance) pour comparer les fichiers.'
         else:
-            intro += 'Ferme les autres fenêtres de Meld avant de comparer.'
+            intro += ('Meld ouvre ta version à gauche et la nouvelle à droite : reporte ce que tu veux garder à gauche, '
+                      'enregistre et ferme Meld. Ferme les autres fenêtres de Meld avant.')
         area.pack_start(label(intro, wrap=True, max_chars=90, css=('dim-label',)), False, False, 0)
         lb = boxed_list()
         chosen = {}
@@ -1826,9 +2060,24 @@ class Pacnew(Item):
         orig = re.sub(r'\.(pacnew|pacsave)$', '', path)
         q, qo = shlex.quote(path), shlex.quote(orig)
         if kind == 'diff':
-            step = Step(['sudo', '-A', '-e', orig, path], askpass=True, env={'SUDO_EDITOR': 'meld'},
-                        label=f'SUDO_EDITOR=meld sudoedit {orig} {path}')
-            label_a = 'Comparer avec Meld'
+            work = os.path.join(XDG_CACHE, 'maintenance', 'fusion')
+            a = os.path.join(work, os.path.basename(orig))
+            b = os.path.join(work, os.path.basename(path))
+            qa, qb = shlex.quote(a), shlex.quote(b)
+            uid, gid = os.getuid(), os.getgid()
+            try:
+                os.makedirs(work, mode=0o700, exist_ok=True)   # dossier à toi : Meld doit pouvoir y enregistrer
+            except OSError as e:
+                self.win.journal.add(f'Impossible de créer {work} : {e}', 'e')
+                return
+            steps = [Step(f'install -m 600 -o {uid} -g {gid} -- {qo} {qa} && '
+                          f'install -m 600 -o {uid} -g {gid} -- {q} {qb}', root=True, stop=True,
+                          label='copies de travail des deux fichiers'),
+                     Step(['meld', a, b], stop=True, label=f'meld {orig} {path}'),
+                     Step(f'cmp -s -- {qa} {qo} || cat -- {qa} > {qo}; rm -f -- {qa} {qb}', root=True,
+                          label=f'enregistrement de {orig} si tu l’as modifié')]
+            self.trigger(Action('Comparer avec Meld', steps))
+            return
         elif kind == 'keep':
             step = Step(['rm', '--', path], root=True)
             label_a = 'Garder ma version'
@@ -2059,6 +2308,13 @@ class ItemRow(Gtk.ListBoxRow):
             self.spinner.show()
             self.spinner.start()
             self.btn_box.pack_start(label('En cours…', css=('dim-label',)), False, False, 0)
+            if win.runner.busy:
+                asked = win.runner.cancel_req
+                b = button('Arrêt en cours…' if asked else 'Arrêter', icon_name='process-stop-symbolic')
+                b.set_tooltip_text('Arrêter cette opération (Échap)')
+                b.set_sensitive(not asked)
+                b.connect('clicked', lambda _b: win.stop_current())
+                self.btn_box.pack_start(b, False, False, 0)
         else:
             self.spinner.stop()
             self.spinner.hide()
@@ -2084,10 +2340,12 @@ SECTIONS = [
     ('apps', 'Applications', ['view-app-grid-symbolic', 'view-grid-symbolic', 'applications-other-symbolic']),
     ('soft', 'Logiciels de maintenance', ['applications-utilities-symbolic', 'applications-system-symbolic',
                                           'preferences-other-symbolic']),
+    ('about', 'À propos', ['help-about-symbolic', 'dialog-information-symbolic']),
 ]
 SECTION_TEXT = {
     'clean': ('Nettoyage', 'Coche ce que tu veux nettoyer puis lance la sélection. Chaque ligne peut aussi être lancée seule.'),
-    'updates': ('Mises à jour', 'Système et AUR, applications Flatpak, firmware, miroirs et trousseau de clés.'),
+    'updates': ('Mises à jour', 'Système et AUR, applications Flatpak, firmware, miroirs et trousseau de clés. '
+                                'La mise à jour de l’application elle-même est dans « À propos ».'),
     'health': ('Santé du système', 'Disques, SSD, services et erreurs du journal. Les analyses ne modifient rien.'),
     'backup': ('Sauvegarde', 'Instantanés du système et liste de tes paquets.'),
     'config': ('Configuration', 'Fichiers de configuration à fusionner et état des paquets installés.'),
@@ -2124,6 +2382,85 @@ class ItemsPage:
             tot, n = self.win.selection_total()
             self.clean_btn.set_label('Nettoyer la sélection' + (f' · {fmt_size(tot)}' if tot else ''))
             self.clean_btn.set_sensitive(n > 0 and not self.win.runner.busy)
+
+
+class AboutPage:
+    """Version, liens du projet, mise à jour de l'application et informations sur le système."""
+
+    def __init__(self, win):
+        self.win = win
+        self.widget, inner = scrolled_page()
+        hero = hbox(22)
+        hero.get_style_context().add_class('card')
+        img = Gtk.Image.new_from_icon_name('applications-system', Gtk.IconSize.DIALOG)
+        img.set_pixel_size(96)
+        img.set_valign(Gtk.Align.START)
+        hero.pack_start(img, False, False, 0)
+        col = vbox(6)
+        col.pack_start(label('Maintenance', css=('about-name',)), False, False, 0)
+        self.ver_l = label('', css=('about-version',), selectable=True)
+        col.pack_start(self.ver_l, False, False, 0)
+        self.state_l = label('', markup=True)
+        col.pack_start(self.state_l, False, False, 0)
+        col.pack_start(label('Nettoyage, mises à jour et santé d’Arch Linux, en une seule fenêtre GTK3 pensée pour '
+                             'Cinnamon.', wrap=True, max_chars=80), False, False, 2)
+        links = hbox(2)
+        for text, uri in (('Dépôt GitHub', REPO_URL), ('Historique des changements', REPO_URL + '/commits/main'),
+                          ('Signaler un problème', REPO_URL + '/issues')):
+            lk = Gtk.LinkButton.new_with_label(uri, text)
+            lk.set_tooltip_text(uri)
+            links.pack_start(lk, False, False, 0)
+        col.pack_start(links, False, False, 0)
+        col.pack_start(label('Licence MIT · © 2026 TheWorms', css=('dim-label', 'small')), False, False, 0)
+        hero.pack_start(col, True, True, 0)
+        inner.pack_start(hero, False, False, 0)
+
+        inner.pack_start(label('Mise à jour', css=('section-title',)), False, False, 4)
+        lb = boxed_list()
+        for it in win.items.values():
+            if it.section == 'about':
+                lb.add(ItemRow(it))
+        inner.pack_start(lb, False, False, 0)
+
+        inner.pack_start(label('Système', css=('section-title',)), False, False, 4)
+        grid = Gtk.Grid(column_spacing=24, row_spacing=6)
+        grid.get_style_context().add_class('card')
+        for i, (k, v) in enumerate(self._system()):
+            grid.attach(label(k, css=('dim-label',)), 0, i, 1, 1)
+            grid.attach(label(v, selectable=True), 1, i, 1, 1)
+        inner.pack_start(grid, False, False, 0)
+        self.widget.show_all()
+
+    @staticmethod
+    def _system():
+        u = platform.uname()
+        desk = os.environ.get('XDG_CURRENT_DESKTOP', '').replace('X-', '') or '—'
+        gtk = f'{Gtk.get_major_version()}.{Gtk.get_minor_version()}.{Gtk.get_micro_version()}'
+        return [('Distribution', distro_name()), ('Noyau Linux', u.release), ('Bureau', desk),
+                ('Ordinateur', socket.gethostname()), ('GTK', gtk), ('Python', platform.python_version()),
+                ('Programme', SELF)]
+
+    def update(self):
+        it = self.win.items['self']
+        st = it.state
+        pkg = st.get('ver')
+        self.ver_l.set_text(f'Version {VERSION}' + (f' · paquet {PKG_NAME} {pkg}' if pkg else ''))
+        if it.probing:
+            txt = '<span foreground="#3d82c8">Recherche d’une nouvelle version…</span>'
+        elif st.get('new'):
+            rv = st.get('remote_ver')
+            txt = (f'<span foreground="#3d82c8"><b>Nouvelle version {GLib.markup_escape_text(rv) + " " if rv else ""}'
+                   'disponible</b></span> : clique sur « Mettre à jour » ci-dessous.')
+        elif st.get('standalone'):
+            txt = '<span foreground="#c07a12">Copie hors paquet : pas de mise à jour automatique.</span>'
+        elif st.get('older'):
+            txt = (f'<span foreground="#c07a12"><b>GitHub a encore la version {GLib.markup_escape_text(st["remote_ver"])}'
+                   '</b></span> : tes derniers changements n’y sont pas encore poussés.')
+        elif (st.get('chip') or ('', ''))[0] == 'ok':
+            txt = '<span foreground="#3a9a52"><b>✓ Tu as la dernière version.</b></span>'
+        else:
+            txt = GLib.markup_escape_text((st.get('chip') or ('', ''))[1])
+        self.state_l.set_markup(txt)
 
 
 class OverviewPage:
@@ -2216,10 +2553,11 @@ class OverviewPage:
                          'Nécessaire pour le cache des paquets (paccache) et la recherche des mises à jour (checkupdates).',
                          'Installer', lambda: items['pkg'].trigger(items['pkg'].get_actions()[0]), 'suggested-action'))
         if items['self'].state.get('new'):
-            todo.append((['applications-system'], 'Nouvelle version de Maintenance',
+            rv = items['self'].state.get('remote_ver')
+            todo.append((['applications-system'], f'Nouvelle version de Maintenance{" " + rv if rv else ""}',
                          'Tu as poussé des changements sur GitHub : l’application peut se mettre à jour.',
-                         'Voir', lambda: win.go('updates'), 'suggested-action'))
-        sys_n = upd - (1 if items['self'].state.get('new') else 0)
+                         'Voir', lambda: win.go('about'), 'suggested-action'))
+        sys_n = upd
         if sys_n:
             todo.append((['system-software-update'], f'{plural(sys_n, "mise à jour", "mises à jour")} disponible{"s" if sys_n > 1 else ""}',
                          'Système, AUR et Flatpak.', 'Voir', lambda: win.go('updates'), None))
@@ -2460,6 +2798,7 @@ class DupsPage:
         self.stop_btn.show()
         self._pulse = GLib.timeout_add(120, lambda: (self.pbar.pulse(), True)[1])
         self.finder = DupFinder(root, min_b, lambda n, ph: GLib.idle_add(self._progress, n, ph))
+        self.win.update_stop()
         self.win.journal.add('')
         self.win.journal.add(f'==> Doublons · recherche dans {root}', 'h')
 
@@ -2471,6 +2810,7 @@ class DupsPage:
     def stop(self):
         if self.finder:
             self.finder.cancelled = True
+            self.win.update_stop()
 
     def _progress(self, n, phase):
         if hasattr(self, 'plabel'):
@@ -2482,6 +2822,7 @@ class DupsPage:
         self.scan_btn.set_sensitive(not self.win.runner.busy)
         self.stop_btn.hide()
         self.finder = None
+        self.win.update_stop()
         if groups is None:
             self.win.journal.add('  Recherche arrêtée.', 'd')
             self._status('edit-copy-symbolic', 'Recherche arrêtée', 'Relance la recherche quand tu veux.')
@@ -2856,6 +3197,10 @@ SOFTWARE = [
 ]
 
 
+# Logiciels qui demandent eux-mêmes les droits administrateur (pkexec) : on les ouvre avec la session.
+ROOT_GUI = {'gsmartcontrol': ['gsmartcontrol'], 'gparted': ['gparted'], 'timeshift': ['timeshift-gtk']}
+
+
 class SoftPage:
     def __init__(self, win):
         self.win = win
@@ -2939,6 +3284,9 @@ class SoftPage:
 
     def open(self, s):
         log = self.win.journal.add
+        if s['pkg'] in ROOT_GUI:
+            self.win.session.launch(ROOT_GUI[s['pkg']], s['name'])
+            return
         if s['desktop'] and launch_desktop(s['desktop'], log):
             return
         cmd = {'btop': ['gnome-terminal', '--', 'btop'], 'timeshift': ['timeshift-launcher'],
@@ -2977,10 +3325,15 @@ class Journal:
         head.get_style_context().add_class('journal-head')
         head.pack_start(symbolic(['utilities-terminal-symbolic'], 16), False, False, 0)
         head.pack_start(label('<b>Journal d’activité</b>', markup=True), False, False, 0)
-        for text, cb in (('Masquer', lambda _b: win.show_journal(False)), ('Effacer', lambda _b: self.clear()),
-                         ('Copier', lambda _b: self.copy())):
+        for text, tip, cb in (('Masquer', 'Cacher le journal (le bouton en haut le réaffiche)',
+                               lambda _b: GLib.idle_add(win.show_journal, False)),
+                              ('Effacer', 'Vider le journal', lambda _b: self.clear()),
+                              ('Copier', 'Copier la sélection, ou tout le journal si rien n’est sélectionné',
+                               self.copy)):
             b = Gtk.Button(label=text)
             b.set_relief(Gtk.ReliefStyle.NONE)
+            b.set_tooltip_text(tip)
+            b.connect('clicked', cb)
             head.pack_end(b, False, False, 0)
         self.widget.pack_start(head, False, False, 0)
         self.view = Gtk.TextView()
@@ -3024,24 +3377,39 @@ class Journal:
     def clear(self):
         self.buf.set_text('')
 
-    def copy(self):
-        txt = self.buf.get_text(self.buf.get_start_iter(), self.buf.get_end_iter(), False)
-        Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(txt, -1)
+    def copy(self, btn=None):
+        sel = self.buf.get_selection_bounds()
+        a, b = sel if sel else (self.buf.get_start_iter(), self.buf.get_end_iter())
+        txt = self.buf.get_text(a, b, False)
+        cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        cb.set_text(txt, -1)
+        cb.store()
+        if btn is not None:
+            btn.set_label('Copié ✓')
+            GLib.timeout_add(1500, lambda: (btn.set_label('Copier'), False)[1])
 
 
 # ============================================================================
 #  Session administrateur
 # ============================================================================
 class SudoSession:
-    """Mot de passe demandé une fois à l'ouverture, puis gardé tant que l'application est ouverte."""
+    """Mot de passe demandé une fois à l'ouverture : un assistant administrateur (lancé par sudo)
+    exécute ensuite toutes les commandes administrateur jusqu'à la fermeture de l'application.
+    Ça marche même quand sudo ne garde pas le mot de passe en mémoire (timestamp_timeout=0)."""
 
     def __init__(self, win):
         self.win = win
         self.ok = False
         self.pending = False
+        self.proc = None
+        self.jobs = {}
+        self.next_id = 1
+        self.lock = threading.Lock()
+        self.start_lock = threading.Lock()
+        self.stopping = False
         self.sock = None
-        self.timer = None
 
+    # --- démarrage de l'assistant
     def start(self):
         self._serve()
         if os.geteuid() != 0 and self.win.settings.get('mot_de_passe_au_lancement', True):
@@ -3050,58 +3418,154 @@ class SudoSession:
     def login(self):
         if self.pending or self.ok:
             return
-        self.pending = True
-        self.win.update_lock()
+        threading.Thread(target=self.ensure, daemon=True).start()
 
-        def work():
+    def ensure(self):
+        """Lance l'assistant si besoin (bloquant : à appeler hors du fil principal)."""
+        if self.ok:
+            return True
+        with self.start_lock:
+            if self.ok:
+                return True
+            self.pending = True
+            GLib.idle_add(self.win.update_lock)
             reset_askpass_counter()
-            rc = sudo_quiet(['-A', '-v'], 'ouverture de Maintenance (le mot de passe reste valable tant que '
-                                          'l’application est ouverte)')
-            GLib.idle_add(self._logged, rc == 0, True)
-        threading.Thread(target=work, daemon=True).start()
+            env = dict(os.environ, MAINTENANCE_ASKPASS_CTX='ouverture de la session (le mot de passe reste valable '
+                                                           'jusqu’à la fermeture de l’application)')
+            try:
+                env['SUDO_ASKPASS'] = askpass_wrapper()
+            except OSError:
+                pass
+            p, ready = None, False
+            try:
+                p = subprocess.Popen(['sudo', '-A', '--', sys.executable, SELF, '--root-helper'],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     env=env, start_new_session=True)
+                kind, _jid, _d = read_frame(p.stdout)
+                ready = kind == b'R'
+            except (OSError, EOFError):
+                ready = False
+            self.pending = False
+            if not ready:
+                if p is not None:
+                    try:
+                        p.kill()
+                    except OSError:
+                        pass
+                GLib.idle_add(self._logged, False)
+                return False
+            self.stopping = False
+            self.proc = p
+            self.ok = True
+            threading.Thread(target=self._reader, args=(p,), daemon=True).start()
+            GLib.idle_add(self._logged, True)
+            return True
 
-    def _logged(self, ok, announce=False):
-        was = self.ok
-        self.pending = False
-        self.ok = ok
-        if ok and not was:
-            self.win.journal.add('Droits administrateur accordés pour toute la session.', 'd')
-        elif not ok and announce:
+    def _logged(self, ok):
+        if ok:
+            self.win.journal.add('Droits administrateur accordés jusqu’à la fermeture de l’application.', 'd')
+        else:
             self.win.journal.add('Droits administrateur non accordés : ils seront demandés à la première action '
                                  '(ou clique sur le cadenas).', 's')
-        if ok and self.timer is None:
-            self.timer = GLib.timeout_add_seconds(KEEPALIVE_SECONDS, self._keepalive)
         self.win.update_lock()
         return False
 
-    def _keepalive(self):
-        if not self.ok:
-            self.timer = None
-            return False
+    def _reader(self, p):
+        try:
+            while True:
+                kind, jid, data = read_frame(p.stdout)
+                q = self.jobs.get(jid)
+                if q is not None:
+                    q.put((kind, data))
+        except (EOFError, OSError, ValueError):
+            pass
+        if self.proc is p:
+            self.proc = None
+            self.ok = False
+            if not self.stopping:
+                GLib.idle_add(self._gone)
+        with self.lock:
+            pending = list(self.jobs.values())
+        for q in pending:
+            q.put((b'X', struct.pack('!i', 1)))
+
+    def _gone(self):
+        self.win.journal.add('L’assistant administrateur s’est arrêté : le mot de passe sera redemandé à la '
+                             'prochaine action.', 's')
+        self.win.update_lock()
+        return False
+
+    # --- exécution
+    def run(self, argv, env=None, cwd=None, on_output=None, detach=False, on_start=None):
+        """Exécute argv en administrateur ; renvoie le code de retour, ou None sans autorisation."""
+        if not self.ensure():
+            return None
+        q = queue.Queue()
+        with self.lock:
+            jid = self.next_id
+            self.next_id += 1
+            self.jobs[jid] = q
+            if on_start:
+                on_start(jid)
+            req = json.dumps({'id': jid, 'argv': [str(a) for a in argv], 'env': env or {},
+                              'cwd': cwd or '/', 'detach': detach}) + '\n'
+            try:
+                self.proc.stdin.write(req.encode('utf-8'))
+                self.proc.stdin.flush()
+            except (OSError, AttributeError, ValueError):
+                self.jobs.pop(jid, None)
+                return 1
+        try:
+            while True:
+                kind, data = q.get()
+                if kind == b'O':
+                    if on_output:
+                        on_output(data)
+                elif kind == b'X':
+                    return struct.unpack('!i', data)[0]
+        finally:
+            with self.lock:
+                self.jobs.pop(jid, None)
+
+    def kill(self, jid):
+        """Arrête une commande administrateur en cours (et tout ce qu'elle a lancé)."""
+        with self.lock:
+            try:
+                self.proc.stdin.write((json.dumps({'id': jid, 'op': 'kill'}) + '\n').encode())
+                self.proc.stdin.flush()
+            except (OSError, AttributeError, ValueError):
+                pass
+
+    def launch(self, argv, name):
+        """Ouvre un logiciel graphique en administrateur (GParted, GSmartControl…) sans redemander le mot de passe."""
+        disp = os.environ.get('DISPLAY', ':0')
+        xauth = os.environ.get('XAUTHORITY') or os.path.join(HOME, '.Xauthority')
 
         def work():
-            rc = sudo_quiet(['-n', '-v'])
-            if rc != 0:
-                GLib.idle_add(self._expired)
+            rc = self.run(['env', f'DISPLAY={disp}', f'XAUTHORITY={xauth}', 'NO_AT_BRIDGE=1'] + list(argv), detach=True)
+            if rc == 0:
+                GLib.idle_add(self.win.journal.add, f'# {" ".join(argv)}   (« {name} » ouvert avec la session '
+                                                     'administrateur)', 'c')
+            else:
+                GLib.idle_add(self.win.journal.add, f'Impossible d’ouvrir « {name} » en administrateur.', 'e')
         threading.Thread(target=work, daemon=True).start()
-        return True
 
-    def _expired(self):
+    # --- arrêt
+    def logout(self, quiet=False):
+        p, self.proc = self.proc, None
+        self.stopping = True
         self.ok = False
-        self.win.journal.add('L’autorisation administrateur a expiré : elle sera redemandée à la prochaine action.', 's')
-        self.win.update_lock()
-        return False
-
-    def logout(self):
-        sudo_quiet(['-k'])
-        self.ok = False
-        self.win.journal.add('Droits administrateur retirés.', 'd')
-        self.win.update_lock()
+        if p is not None:
+            try:
+                p.stdin.close()
+            except OSError:
+                pass
+        if not quiet:
+            self.win.journal.add('Droits administrateur retirés.', 'd')
+            self.win.update_lock()
 
     def stop(self):
-        if self.ok:
-            sudo_quiet(['-k'])
-        self.ok = False
+        self.logout(quiet=True)
         s, self.sock = self.sock, None
         if s:
             try:
@@ -3110,7 +3574,7 @@ class SudoSession:
             except OSError:
                 pass
 
-    # --- relais pour yay : ses appels « sudo pacman » passent par l'application
+    # --- relais local : fenêtre de mot de passe et « sudo pacman » de yay
     def _serve(self):
         try:
             os.makedirs(SESSION_DIR, mode=0o700, exist_ok=True)
@@ -3119,14 +3583,14 @@ class SudoSession:
                 os.unlink(RELAY_SOCK)
             except FileNotFoundError:
                 pass
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.bind(RELAY_SOCK)
+            sk = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sk.bind(RELAY_SOCK)
             os.chmod(RELAY_SOCK, 0o600)
-            s.listen(4)
-            self.sock = s
+            sk.listen(4)
+            self.sock = sk
             threading.Thread(target=self._accept, daemon=True).start()
         except OSError as e:
-            self.win.journal.add(f'Relais pour yay indisponible ({e}) : yay demandera son propre mot de passe.', 's')
+            self.win.journal.add(f'Relais local indisponible ({e}) : yay demandera son propre mot de passe.', 's')
 
     def _accept(self):
         while self.sock is not None:
@@ -3136,48 +3600,58 @@ class SudoSession:
                 return
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
 
-    @staticmethod
-    def _refuse(conn, msg):
-        send_frame(conn, b'O', f'maintenance : {msg}\n'.encode())
-        send_frame(conn, b'X', struct.pack('!i', 126))
-
     def _handle(self, conn):
         with conn:
             try:
                 raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i'))
                 pid, uid, _gid = struct.unpack('3i', raw)
                 if uid != os.getuid() or not is_descendant(pid, os.getpid()):
-                    self._refuse(conn, 'demande refusée (programme extérieur à l’application).')
+                    sock_send(conn, b'N', 'maintenance : demande refusée (programme extérieur à l’application).'.encode())
                     return
-                line = b''
-                while not line.endswith(b'\n'):
-                    chunk = conn.recv(65536)
-                    if not chunk or len(line) > 1 << 20:
-                        return
-                    line += chunk
+                line = conn.makefile('rb').readline(1 << 20)
                 req = json.loads(line.decode('utf-8'))
+                if 'askpass' in req:
+                    pw = self._ask_in_app(req)
+                    if pw is None:
+                        sock_send(conn, b'X', struct.pack('!i', 1))
+                    else:
+                        sock_send(conn, b'P', pw.encode('utf-8'))
+                    return
                 argv = [str(a) for a in req.get('argv', [])]
-                cwd = req.get('cwd')
                 if not argv or all(a.startswith('-') for a in argv):
-                    # « sudo -v » (boucle sudo de yay) : simple vérification du ticket
-                    send_frame(conn, b'X', struct.pack('!i', sudo_quiet(['-n', '-v'])))
+                    # « sudo -v » (boucle sudo de yay) : la session est-elle ouverte ?
+                    sock_send(conn, b'X', struct.pack('!i', 0 if self.ensure() else 1))
                     return
                 if os.path.basename(argv[0]) != 'pacman':
-                    self._refuse(conn, f'seule la commande pacman est relayée (reçu : {argv[0]}).')
+                    sock_send(conn, b'N', f'maintenance : seule la commande pacman est relayée (reçu : {argv[0]}).'.encode())
                     return
-                env = dict(os.environ, MAINTENANCE_ASKPASS_CTX='mise à jour AUR (yay)')
-                env['SUDO_ASKPASS'] = askpass_wrapper()
-                p = subprocess.Popen(['sudo', '-A', '--', 'pacman'] + argv[1:], stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
-                                     cwd=cwd if cwd and os.path.isdir(cwd) else None, start_new_session=True)
-                while True:
-                    chunk = p.stdout.read1(65536)
-                    if not chunk:
-                        break
-                    send_frame(conn, b'O', chunk)
-                send_frame(conn, b'X', struct.pack('!i', p.wait()))
+                rc = self.run(['pacman'] + argv[1:], cwd=req.get('cwd'),
+                              on_output=lambda d: sock_send(conn, b'O', d))
+                sock_send(conn, b'X', struct.pack('!i', 126 if rc is None else rc))
             except (OSError, ValueError, EOFError, struct.error):
                 pass
+
+    def _ask_in_app(self, req):
+        done = threading.Event()
+        res = {}
+
+        def show():
+            dlg, entry = password_dialog(str(req.get('askpass') or ''), str(req.get('ctx') or ''),
+                                         int(req.get('tries') or 0), parent=self.win)
+
+            def answer(d, r):
+                txt = entry.get_text()
+                res['pw'] = txt if r == Gtk.ResponseType.OK and txt else None
+                d.destroy()
+                done.set()
+            dlg.connect('response', answer)
+            dlg.show_all()
+            dlg.present()
+            entry.grab_focus()
+            return False
+        GLib.idle_add(show)
+        done.wait()
+        return res.get('pw')
 
 
 # ============================================================================
@@ -3216,6 +3690,8 @@ button.tile.warn { border-left-color: #c07a12; }
 button.tile.crit { border-left-color: #d4453f; }
 button.tile.info { border-left-color: #3d82c8; }
 .tile-big { font-size: 155%; font-weight: bold; }
+.about-name { font-size: 190%; font-weight: bold; }
+.about-version { font-size: 105%; opacity: 0.8; }
 .badge { border-radius: 10px; padding: 0px 7px; font-size: 80%; font-weight: bold; }
 .badge.warn { color: #c07a12; background-color: rgba(192, 122, 18, 0.18); }
 .badge.crit { color: #d4453f; background-color: rgba(212, 69, 63, 0.16); }
@@ -3265,6 +3741,20 @@ class MainWindow(Gtk.ApplicationWindow):
         hb.pack_start(self.refresh_btn)
         self.spinner = Gtk.Spinner()
         hb.pack_start(self.spinner)
+        self.stop_btn = Gtk.Button()
+        sb = hbox(6)
+        sb.pack_start(symbolic(['process-stop-symbolic', 'media-playback-stop-symbolic'], 16), False, False, 0)
+        self.stop_lbl = label('Arrêter')
+        sb.pack_start(self.stop_lbl, False, False, 0)
+        self.stop_btn.add(sb)
+        self.stop_btn.get_style_context().add_class('destructive-action')
+        self.stop_btn.set_tooltip_text('Arrêter l’opération en cours (Échap). pacman, yay, le firmware et les '
+                                       'instantanés ne sont jamais coupés au milieu : l’arrêt attend la fin de '
+                                       'leur étape.')
+        self.stop_btn.connect('clicked', lambda _b: self.stop_current())
+        self.stop_btn.set_no_show_all(True)
+        sb.show_all()
+        hb.pack_start(self.stop_btn)
         self.jbtn = Gtk.ToggleButton()
         self.jbtn.set_image(symbolic(['utilities-terminal-symbolic'], 16))
         self.jbtn.set_tooltip_text('Journal d’activité')
@@ -3315,6 +3805,7 @@ class MainWindow(Gtk.ApplicationWindow):
             self.badges[sid] = badge
             row.add(b)
             self.side_list.add(row)
+        self.side_list.set_header_func(self._side_header)
         self.side_list.connect('row-selected', self._section_selected)
         ssw = Gtk.ScrolledWindow()
         ssw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -3354,6 +3845,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.pages['dups'] = DupsPage(self)
         self.pages['apps'] = AppsPage(self)
         self.pages['soft'] = SoftPage(self)
+        self.pages['about'] = AboutPage(self)
         for sid, _n, _i in SECTIONS:
             self.stack.add_named(self.pages[sid].widget, sid)
         self.paned.pack1(self.stack, True, False)
@@ -3370,8 +3862,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self._update_sim_ui()
         self.show_journal(self.settings.get('journal', True))
         rc, out, _ = run(['pacman', '-Q', PKG_NAME], timeout=5)
-        shown = out.split()[1] if rc == 0 and len(out.split()) > 1 else VERSION
-        self.journal.add(f'Maintenance {shown} prête.', 'd')
+        pkg = f' ({out.split()[1]})' if rc == 0 and len(out.split()) > 1 else ''
+        self.journal.add(f'Maintenance {VERSION}{pkg} prête.', 'd')
         if self.sim:
             self.journal.add('Mode simulation activé : les actions qui modifient le système sont seulement affichées ici.', 's')
         self.side_list.select_row(self.side_list.get_row_at_index(0))
@@ -3388,6 +3880,14 @@ class MainWindow(Gtk.ApplicationWindow):
         return False
 
     # --- navigation ---
+    @staticmethod
+    def _side_header(row, _before):
+        if row.sid == 'about' and row.get_header() is None:
+            sep = Gtk.Separator()
+            sep.set_margin_top(4)
+            sep.set_margin_bottom(4)
+            row.set_header(sep)
+
     def _section_selected(self, _lb, row):
         if row is not None:
             self.stack.set_visible_child_name(row.sid)
@@ -3416,7 +3916,7 @@ class MainWindow(Gtk.ApplicationWindow):
     def _refresh_ui(self):
         self._dirty = False
         self.pages['overview'].update()
-        for sec in ('clean', 'updates', 'health', 'backup', 'config'):
+        for sec in ('clean', 'updates', 'health', 'backup', 'config', 'about'):
             self.pages[sec].update()
         rec = self.reclaim_total()
         upd = self.updates_count()
@@ -3425,7 +3925,8 @@ class MainWindow(Gtk.ApplicationWindow):
         values = {'clean': ('warn', fmt_size(rec)) if rec > 50 * 1024 ** 2 else None,
                   'updates': ('info', str(upd)) if upd else None,
                   'health': ('crit', str(issues)) if issues else None,
-                  'config': ('warn', str(pn)) if pn else None}
+                  'config': ('warn', str(pn)) if pn else None,
+                  'about': ('info', '1') if self.items['self'].state.get('new') else None}
         for sid, badge in self.badges.items():
             v = values.get(sid)
             ctx = badge.get_style_context()
@@ -3440,7 +3941,7 @@ class MainWindow(Gtk.ApplicationWindow):
         return False
 
     def updates_count(self):
-        return sum(self.items[i].state.get('count', 0) for i in ('sys', 'fpk', 'self')
+        return sum(self.items[i].state.get('count', 0) for i in ('sys', 'fpk')
                    if self.items[i].available)
 
     def reclaim_total(self):
@@ -3557,6 +4058,7 @@ class MainWindow(Gtk.ApplicationWindow):
             self.session.logout()
         else:
             self.session.login()
+            self.update_lock()
 
     # --- interface ---
     def set_step(self, text):
@@ -3565,7 +4067,30 @@ class MainWindow(Gtk.ApplicationWindow):
             self.hb.props.subtitle = f'En cours : {short}'
         return False
 
+    def stop_current(self):
+        if self.runner.busy:
+            self.runner.cancel()
+        dups = self.pages.get('dups')
+        if dups is not None and dups.finder is not None:
+            dups.stop()
+        self.update_stop()
+
+    def update_stop(self):
+        dups = self.pages.get('dups') if hasattr(self, 'pages') else None
+        scanning = dups is not None and dups.finder is not None
+        busy = self.runner.busy or scanning
+        self.stop_btn.set_visible(busy)
+        asked = (self.runner.busy and self.runner.cancel_req) or (scanning and dups.finder.cancelled)
+        self.stop_lbl.set_text('Arrêt en cours…' if asked else 'Arrêter')
+        self.stop_btn.set_sensitive(not asked)
+        if self.runner.busy and hasattr(self, 'items'):
+            for it in self.items.values():
+                if it.busy and it.row:
+                    it.row.update()
+        return False
+
     def set_busy(self, busy):
+        self.update_stop()
         self.spinner.start() if busy else self.spinner.stop()
         self.hb.props.subtitle = self.base_sub + (' · opération en cours…' if busy else '')
         self.refresh_btn.set_sensitive(not busy)
@@ -3606,6 +4131,9 @@ class MainWindow(Gtk.ApplicationWindow):
             return True
         if ev.keyval in (Gdk.KEY_q, Gdk.KEY_Q) and ev.state & Gdk.ModifierType.CONTROL_MASK:
             self.close()
+            return True
+        if ev.keyval == Gdk.KEY_Escape and self.stop_btn.get_visible() and self.stop_btn.get_sensitive():
+            self.stop_current()
             return True
         return False
 
