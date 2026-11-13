@@ -138,10 +138,11 @@ if __name__ == '__main__' and sys.argv[1:2] == ['--root-helper']:
 
 import gi  # noqa: E402
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, Gdk, Gio, GLib, Pango  # noqa: E402
+gi.require_version('GdkPixbuf', '2.0')
+from gi.repository import Gtk, Gdk, GdkPixbuf, Gio, GLib, Pango  # noqa: E402
 
 APP_ID = 'io.github.theworms.Maintenance'
-VERSION = '1.5.1'
+VERSION = '1.5.2'
 REPO_URL = 'https://github.com/TheWorms/maintenance'
 REPO_API = 'https://api.github.com/repos/TheWorms/maintenance'
 PKG_NAME = 'maintenance-git'
@@ -854,6 +855,38 @@ def label(text='', css=(), wrap=False, xalign=0.0, markup=False, selectable=Fals
 
 def chip(kind, text):
     return label(text, css=('chip', kind))
+
+
+def glyph_icon(kind, color, size=36):
+    """Soleil ou lune dessinés pixel par pixel (sans cairo ni thème d'icônes), en GIcon."""
+    import math
+    rgb = Gdk.RGBA()
+    rgb.parse(color)
+    r8, g8, b8 = int(rgb.red * 255), int(rgb.green * 255), int(rgb.blue * 255)
+    ss = 4
+    n = size * ss
+    c = n / 2
+
+    def inside(x, y):
+        dx, dy = x - c, y - c
+        if kind == 'sun':
+            if math.hypot(dx, dy) <= n * 0.2:
+                return True
+            t = round(math.atan2(dy, dx) / (math.pi / 4)) * math.pi / 4
+            ux, uy = math.cos(t), math.sin(t)
+            p, q = dx * ux + dy * uy, abs(dy * ux - dx * uy)
+            pc = min(max(p, n * 0.33), n * 0.45)
+            return math.hypot(p - pc, q) <= n * 0.055
+        return math.hypot(dx, dy) <= n * 0.4 and math.hypot(dx - n * 0.22, dy + n * 0.17) > n * 0.33
+
+    buf = bytearray(size * size * 4)
+    for py in range(size):
+        for px in range(size):
+            cnt = sum(inside(px * ss + sx + 0.5, py * ss + sy + 0.5) for sy in range(ss) for sx in range(ss))
+            o = (py * size + px) * 4
+            buf[o:o + 4] = bytes((r8, g8, b8, 255 * cnt // (ss * ss)))
+    return GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(bytes(buf)), GdkPixbuf.Colorspace.RGB, True, 8,
+                                           size, size, size * 4)
 
 
 TONES = ('ok', 'warn', 'crit', 'info', 'off', 'done')
@@ -4148,6 +4181,8 @@ class MainWindow(Gtk.ApplicationWindow):
         hb.pack_end(self.jbtn)
         self.theme_btn = Gtk.Button()
         self.theme_btn.get_style_context().add_class('icon-btn')
+        self.theme_img = Gtk.Image()
+        self.theme_btn.add(self.theme_img)
         self.theme_btn.connect('clicked', lambda _b: self.toggle_theme())
         hb.pack_end(self.theme_btn)
         self.update_theme_btn()
@@ -4466,8 +4501,9 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def update_theme_btn(self):
         dark = self.is_dark()
-        self.theme_btn.set_image(symbolic(['weather-clear-symbolic', 'display-brightness-symbolic'] if dark else
-                                          ['weather-clear-night-symbolic', 'night-light-symbolic'], 16))
+        fg = PALETTES['sombre' if dark else 'clair']['fg']
+        self.theme_img.set_from_gicon(glyph_icon('sun' if dark else 'moon', fg), Gtk.IconSize.MENU)
+        self.theme_img.set_pixel_size(18)
         self.theme_btn.set_tooltip_text('Passer en thème clair' if dark else 'Passer en thème sombre')
 
     def _lock_clicked(self):
