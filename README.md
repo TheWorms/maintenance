@@ -71,7 +71,7 @@ nouveautés restera alors vide).
   d’origine n’est réécrit que si tu l’as modifié.
 - **Paquets protégés** : le noyau, pacman, yay, sudo, systemd, le bureau Cinnamon et l’application
   elle-même ne peuvent pas être désinstallés depuis la liste des applications.
-- **Bouton Arrêter** (barre de titre, ligne en cours, ou touche Échap) : coupe une analyse ou un outil
+- **Bouton Arrêter** (à droite de la ligne en cours, ou touche Échap) : coupe une analyse ou un outil
   qui prend du temps (SMART, vérification des paquets, espace par dossier, doublons…) et ne lance
   pas les étapes suivantes. pacman, yay, la mise à jour du firmware et la création d’un instantané
   ne sont jamais coupés au milieu : l’arrêt attend la fin de leur étape.

@@ -141,7 +141,7 @@ gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, Gio, GLib, Pango  # noqa: E402
 
 APP_ID = 'io.github.theworms.Maintenance'
-VERSION = '1.4'
+VERSION = '1.4.1'
 REPO_URL = 'https://github.com/TheWorms/maintenance'
 REPO_API = 'https://api.github.com/repos/TheWorms/maintenance'
 PKG_NAME = 'maintenance-git'
@@ -1787,7 +1787,10 @@ class Trim(Item):
         if not self.state.get('enabled'):
             acts.append(Action('Activer chaque semaine', [Step(['systemctl', 'enable', '--now', 'fstrim.timer'], root=True)],
                                style='suggested-action'))
-        acts.append(Action('Lancer maintenant', [Step(['fstrim', '-av'], root=True)]))
+        acts.append(Action('Lancer maintenant', [Step(['fstrim', '--listed-in', '/etc/fstab:/proc/self/mountinfo',
+                                                        '--verbose', '--quiet-unsupported'], root=True,
+                                                       label='fstrim --listed-in /etc/fstab --verbose '
+                                                             '--quiet-unsupported')]))
         return acts
 
 
@@ -3741,20 +3744,6 @@ class MainWindow(Gtk.ApplicationWindow):
         hb.pack_start(self.refresh_btn)
         self.spinner = Gtk.Spinner()
         hb.pack_start(self.spinner)
-        self.stop_btn = Gtk.Button()
-        sb = hbox(6)
-        sb.pack_start(symbolic(['process-stop-symbolic', 'media-playback-stop-symbolic'], 16), False, False, 0)
-        self.stop_lbl = label('Arrêter')
-        sb.pack_start(self.stop_lbl, False, False, 0)
-        self.stop_btn.add(sb)
-        self.stop_btn.get_style_context().add_class('destructive-action')
-        self.stop_btn.set_tooltip_text('Arrêter l’opération en cours (Échap). pacman, yay, le firmware et les '
-                                       'instantanés ne sont jamais coupés au milieu : l’arrêt attend la fin de '
-                                       'leur étape.')
-        self.stop_btn.connect('clicked', lambda _b: self.stop_current())
-        self.stop_btn.set_no_show_all(True)
-        sb.show_all()
-        hb.pack_start(self.stop_btn)
         self.jbtn = Gtk.ToggleButton()
         self.jbtn.set_image(symbolic(['utilities-terminal-symbolic'], 16))
         self.jbtn.set_tooltip_text('Journal d’activité')
@@ -4075,14 +4064,14 @@ class MainWindow(Gtk.ApplicationWindow):
             dups.stop()
         self.update_stop()
 
-    def update_stop(self):
+    def can_stop(self):
         dups = self.pages.get('dups') if hasattr(self, 'pages') else None
-        scanning = dups is not None and dups.finder is not None
-        busy = self.runner.busy or scanning
-        self.stop_btn.set_visible(busy)
-        asked = (self.runner.busy and self.runner.cancel_req) or (scanning and dups.finder.cancelled)
-        self.stop_lbl.set_text('Arrêt en cours…' if asked else 'Arrêter')
-        self.stop_btn.set_sensitive(not asked)
+        if dups is not None and dups.finder is not None and not dups.finder.cancelled:
+            return True
+        return self.runner.busy and not self.runner.cancel_req
+
+    def update_stop(self):
+        """Met à jour le bouton « Arrêter » de la ligne en cours (« Arrêt en cours… » une fois demandé)."""
         if self.runner.busy and hasattr(self, 'items'):
             for it in self.items.values():
                 if it.busy and it.row:
@@ -4132,7 +4121,7 @@ class MainWindow(Gtk.ApplicationWindow):
         if ev.keyval in (Gdk.KEY_q, Gdk.KEY_Q) and ev.state & Gdk.ModifierType.CONTROL_MASK:
             self.close()
             return True
-        if ev.keyval == Gdk.KEY_Escape and self.stop_btn.get_visible() and self.stop_btn.get_sensitive():
+        if ev.keyval == Gdk.KEY_Escape and self.can_stop():
             self.stop_current()
             return True
         return False
